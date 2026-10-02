@@ -1,0 +1,56 @@
+services:
+  backend:
+    build:
+      context: .
+      pull: true
+      no_cache: true
+    pull_policy: build
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      RUST_LOG: ${RUST_LOG:-streambot_remote_backend=debug,tower_http=debug,info}
+      RUST_BACKTRACE: ${RUST_BACKTRACE:-1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+
+  postgres:
+    image: postgres:18-trixie
+    user: "0:0"
+    pull_policy: always
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: streambot
+      POSTGRES_PASSWORD: streambot
+      POSTGRES_DB: streambot_remote
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U streambot -d streambot_remote"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  valkey:
+    image: valkey/valkey:9.1-trixie
+    pull_policy: always
+    restart: unless-stopped
+    command: ["valkey-server", "--save", "60", "1", "--appendonly", "yes"]
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+volumes:
+  postgres_data:
+  valkey_data:

@@ -1,0 +1,401 @@
+# streambot-remote-backend
+
+Cloud backend for Streambot Remote. Rust/Axum + PostgreSQL + Valkey.
+
+## Auth routes
+
+- `GET /auth/bot` — broadcaster/control Twitch authorization. Creates/updates the streamer and opens an owner session.
+- `GET /auth/message-bot` — attaches the secondary Twitch chat identity to the currently logged-in owner streamer.
+- `GET /auth/mod?streamer=<login>` — moderator login for one streamer.
+- callbacks live under the corresponding `/callback` route.
+
+The browser receives only an opaque HttpOnly session cookie. OAuth state and sessions live in Valkey. Twitch access/refresh tokens are AES-256-GCM encrypted before being written to PostgreSQL.
+
+## Streambot instance auth
+
+Owners can create one or more local Streambot instance tokens. The raw token is returned once; only its SHA-256 hash is stored.
+
+Local Streambot can validate its token with:
+
+```http
+POST /api/v1/instance-auth
+Authorization: Bearer <instance-token>
+```
+
+This is intentionally transport-agnostic so WebSocket/mod-control support can be added later without changing identity/auth.
+
+## Run
+
+```bash
+cp .env.example .env
+# fill Twitch credentials and encryption key
+# key example: openssl rand -base64 32
+docker compose up --build
+```
+
+Register these redirect URLs in the Twitch developer console for local development:
+
+- `http://localhost:8080/auth/bot/callback`
+- `http://localhost:8080/auth/message-bot/callback`
+- `http://localhost:8080/auth/mod/callback`
+
+## API implemented in v0.1
+
+- session: `/api/v1/me`
+- accessible streamers: `/api/v1/streamers`
+- mods: `/api/v1/streamers/:id/mods`
+- Streambot instances: `/api/v1/streamers/:id/instances`
+- local instance authentication: `/api/v1/instance-auth`
+
+## Streambot Twitch OAuth broker
+
+`/auth/bot` and `/auth/message-bot` are credential bootstrap flows for a local Streambot. They are not cloud user logins and do not register a streamer or store Twitch credentials in PostgreSQL.
+
+1. Streambot opens `/auth/bot?return_to=http://localhost:...` or `/auth/message-bot?return_to=...`.
+2. Twitch redirects back to the cloud callback.
+3. The cloud stores the resulting Twitch token payload in Valkey for 120 seconds under a one-time exchange code.
+4. The browser is redirected to the supplied local URL with `code=<one-time-code>`.
+5. Streambot calls `POST /api/v1/twitch/exchange` with `{ "code": "..." }`.
+6. The response contains `client_id`, `access_token`, `refresh_token`, `expires_in`, `obtainment_timestamp`, scopes and Twitch user information. The exchange code is deleted immediately.
+
+`POST /api/v1/instance-auth` is unrelated to Twitch OAuth and only authenticates already-registered Streambot instances using their bearer instance token.
+
+## Cloud user login
+
+Streamer and moderator access use one Twitch login endpoint:
+
+```text
+GET /auth/login
+GET /auth/login/callback
+```
+
+The Twitch user is created/updated as the owner of their own streamer identity. Moderator access is evaluated dynamically from Streambot-provided Valkey moderator maps, not persisted in the cloud session or PostgreSQL. This flow is separate from `/auth/bot` and `/auth/message-bot`, which are OAuth brokers for local Streambot credentials only.
+
+For localhost development add this OAuth redirect URL in the Twitch Developer Console:
+
+```text
+http://localhost:8080/auth/login/callback
+```
+
+
+## Streambot cloud transport
+
+### Pair/register a Streambot from the Streambot itself
+
+The cloud user should already be logged into the panel and connected to `GET /ws/user`.
+
+1. Streambot starts registration:
+
+```http
+POST /api/v1/streambot/registration/start
+Content-Type: application/json
+
+{"name":"Main Streambot","twitch_login":"eliteschw31n"}
+```
+
+The response contains only `pairing_id`, `twitch_login`, and `expires_in`. The PIN is **not** returned to Streambot.
+
+2. The cloud sends the matching logged-in user's panel this WebSocket event:
+
+```json
+{"type":"streambot_registration","status":"pending","pairing_id":"...","name":"Main Streambot","twitch_login":"eliteschw31n","pin":"123456","expires_in":600}
+```
+
+The panel shows the six-digit PIN. The user types it into the local Streambot admin panel.
+
+3. Streambot verifies it:
+
+```http
+POST /api/v1/streambot/registration/verify
+Content-Type: application/json
+
+{"pairing_id":"...","pin":"123456"}
+```
+
+On success the response contains the permanent instance `token`, `instance_id`, and `streamer_id`. Store the token locally and use it for `/ws/streambot` and `/api/v1/instance-auth`. The PIN expires after 10 minutes and permits at most five attempts.
+
+The panel receives a second `streambot_registration` event with `status: "completed"`. Pending registrations are replayed when `/ws/user` reconnects.
+
+Cloud users can still create an instance directly with `POST /api/v1/streamers/:id/instances`.
+
+### Streambot WebSocket
+
+Connect to:
+
+`GET /ws/streambot?token=<instance-token>`
+
+A Bearer token header is also accepted. The cloud validates the token against the hashed token in PostgreSQL and records the connection as online.
+
+Streambot -> cloud messages are JSON. Supported core messages:
+
+```json
+{"type":"moderators","moderators":[{"twitch_user_id":"123","login":"some_mod","display_name":"Some Mod"}]}
+```
+
+or a moderator object keyed by Twitch user ID:
+
+```json
+{"type":"moderators","moderators":{"123":{"login":"some_mod","display_name":"Some Mod"}}}
+```
+
+Moderator maps are saved **only in Valkey** under the instance and are never written to PostgreSQL.
+
+Publish the trimmed remote-panel state with:
+
+```json
+{"type":"snapshot","data":{"macros":[],"interactions":[],"status":{}}}
+```
+
+`type: "state"` is accepted as an alias for `snapshot`.
+
+The cloud sends actions back through the same socket as:
+
+```json
+{
+  "type":"action",
+  "request_id":"...",
+  "action":"macro.run",
+  "payload":{"id":"..."},
+  "requested_by":{"twitch_user_id":"...","login":"..."}
+}
+```
+
+### Mod-panel API
+
+All routes use the cloud `/auth/login` session cookie.
+
+- `GET /api/v1/mod/instances` — instances the logged-in user owns or currently moderates.
+- `GET /api/v1/mod/instances/:id/state` — trimmed state most recently pushed by Streambot.
+- `POST /api/v1/mod/instances/:id/actions` — send an allowed/action name + payload to the connected Streambot.
+
+Example action body:
+
+```json
+{"action":"macro.run","payload":{"id":"scene-switch"}}
+```
+
+Moderator access is evaluated dynamically from the latest Valkey moderator map. A moderator does not need to log out/in when Streambot changes the map.
+
+## User settings
+
+Authenticated cloud users have durable settings stored in PostgreSQL. Currently supported:
+
+- `language` (default: `en`)
+
+Endpoints:
+
+```text
+GET /api/v1/user/settings
+PUT /api/v1/user/settings
+```
+
+Example update:
+
+```json
+{
+  "language": "de"
+}
+```
+
+`GET /api/v1/me` also includes the resolved `language`.
+
+## Streambot PIN registration
+
+Registration is initiated by the local Streambot and verified by a human-visible PIN.
+
+1. The cloud panel user logs in normally through `/auth/login` and keeps `/ws/user` connected.
+2. Streambot calls `POST /api/v1/streambot/registration/start` with `{"name":"My Streambot","twitch_login":"channelname"}`.
+3. Cloud stores the pending registration in Valkey for 10 minutes and sends the six-digit PIN only to that Twitch user's `/ws/user` connections.
+4. The panel shows the PIN. The user types it into the local Streambot admin panel.
+5. Streambot calls `POST /api/v1/streambot/registration/verify` with `{"pairing_id":"...","pin":"123456"}`.
+6. Cloud creates the durable `streambot_instances` record and returns the one-time-visible permanent instance token.
+
+The PIN is never returned from the registration start endpoint, is never stored in PostgreSQL, expires after 10 minutes, and is limited to five verification attempts.
+
+## Cached remote dashboard
+
+The remote dashboard is owner/mod accessible and uses Valkey as the state cache. Supported sections are:
+
+- `music`
+- `giveaway`
+- `interactions`
+- `auto_macros`
+- `macros`
+- `channel_points`
+- `rotating_scene`
+- `audio`
+- `obs`
+- `yolobox`
+
+Streambot can publish all cached sections at once:
+
+```json
+{"type":"dashboard_snapshot","data":{"music":{},"giveaway":{},"interactions":[],"auto_macros":[],"macros":[],"channel_points":[],"rotating_scene":{},"audio":{},"obs":{},"yolobox":{}}}
+```
+
+or update one section:
+
+```json
+{"type":"dashboard_update","section":"music","data":{"playing":true,"title":"..."}}
+```
+
+The legacy `snapshot`/`state` message still writes `panel_state` and additionally copies recognized dashboard sections into the section cache.
+
+Panel endpoints (cloud session cookie required; owners and current Valkey moderators are allowed):
+
+- `GET /api/v1/panel/instances`
+- `GET /api/v1/panel/instances/:id/dashboard`
+- `GET /api/v1/panel/instances/:id/dashboard/:section`
+- `POST /api/v1/panel/instances/:id/dashboard/:section`
+- `GET /api/v1/panel/instances/:id/yolobox/preview`
+
+A section action body is:
+
+```json
+{"action":"play","payload":{}}
+```
+
+and is forwarded to Streambot as `type: "dashboard_action"` with `section`, `action`, `payload`, `request_id` and `requested_by`.
+
+### Yolobox preview
+
+Streambot may push a small still preview over the authenticated websocket:
+
+```json
+{"type":"yolobox_preview","mime":"image/jpeg","data":"<base64>"}
+```
+
+JPEG, WebP and PNG are accepted, max 2 MB. The decoded image is kept in Valkey for 30 seconds and served from `/api/v1/panel/instances/:id/yolobox/preview`. This is intended for periodically refreshed still previews, not a full video stream.
+
+## Native Streambot snapshot support
+
+The cloud accepts Streambot's native websocket payload:
+
+```json
+{"type":"snapshot","data":{"dashboard":{...}}}
+```
+
+`data.dashboard` is the canonical remote-panel cache source. Supported dashboard sections are cached separately in Valkey. Macro task bodies are intentionally stripped before caching/exposing to remote users; macro controls only need the macro name. The user websocket receives `dashboard_invalidated` when cached dashboard data changes.
+
+## Instance dashboard WebSocket protocol
+
+The remote instance dashboard is WebSocket-only via `GET /ws/user` using the cloud session cookie. Dashboard state and controls are not exposed through REST routes.
+
+Server notifications:
+- `notify_instances_update`
+- `notify_instance_presence`
+- `notify_dashboard_snapshot`
+- `notify_dashboard_update`
+- `notify_dashboard_action_accepted`
+- `notify_yolobox_preview`
+- `notify_error`
+
+Client messages:
+- `{"type":"request_instances"}`
+- `{"type":"request_dashboard","instance_id":"<uuid>"}`
+- `{"type":"request_dashboard_section","instance_id":"<uuid>","section":"music"}`
+- `{"type":"dashboard_action","instance_id":"<uuid>","section":"music","action":"play","payload":{},"request_id":"<optional uuid>"}`
+- `{"type":"request_yolobox_preview","instance_id":"<uuid>"}`
+
+Streambot dashboard snapshots/updates are still cached in Valkey. The WebSocket server reads from that cache and pushes current values directly; the panel never performs an HTTP dashboard fetch.
+
+## Web panel transport
+
+After `/auth/login` creates the browser session, the remote panel uses only `GET /ws/user` for application data and controls. Panel REST endpoints for profile, settings, streamer/instance management, moderator state, dashboard state and dashboard actions are intentionally not registered.
+
+The socket automatically emits bootstrap notifications:
+
+- `notify_user_update`
+- `notify_user_settings_update`
+- `notify_streamers_update`
+- `notify_instances_update`
+- pending `streambot_registration` PIN events
+
+Client request/action messages include:
+
+- `request_user`
+- `request_user_settings`
+- `update_user_settings` (`language`)
+- `request_streamers`
+- `request_instances`
+- `request_streamer_instances` (`streamer_id`)
+- `create_instance` (`streamer_id`, `name`)
+- `delete_instance` (`streamer_id`, `instance_id`)
+- `request_dashboard` (`instance_id`)
+- `request_dashboard_section` (`instance_id`, `section`)
+- `dashboard_action` (`instance_id`, `section`, `action`, `payload`, optional `request_id`)
+- `request_yolobox_preview` (`instance_id`)
+
+Authentication/OAuth/logout, the Twitch one-time token exchange, health, Streambot registration start/verify/status and the authenticated Streambot machine websocket remain HTTP/machine-facing where appropriate.
+
+## Realtime remote panel contract
+
+`/ws/user` is push-first. On connection the server immediately sends the current user,
+settings, streamer access, instance list, cached dashboard snapshots for every accessible
+instance, cached Yolobox preview frames when present, and pending registration PINs.
+There are no normal `request_*`/reload messages for panel data. Streambot state changes
+are pushed as `notify_dashboard_snapshot`, `notify_dashboard_update`,
+`notify_yolobox_preview`, and `notify_instance_presence` events.
+
+The browser normally sends only mutations/actions such as `update_user_settings`,
+`create_instance`, `delete_instance`, and `dashboard_action`. `resync` exists only as a
+recovery/debug mechanism; reconnecting the websocket performs a complete bootstrap.
+
+## Realtime user WebSocket notification contract
+
+The authenticated web panel is realtime-first. `/ws/user` sends current state on connect and every meaningful state mutation emits an explicit `notify_*` message. Normal UI code should not poll or expose reload buttons.
+
+Notable notifications include:
+
+- `notify_user_update`
+- `notify_user_settings_update`
+- `notify_streamers_update`
+- `notify_instances_update`
+- `notify_instance_created`
+- `notify_instance_presence`
+- `notify_instance_access_granted`
+- `notify_instance_access_revoked`
+- `notify_moderators_update`
+- `notify_streambot_registration`
+- `notify_dashboard_snapshot`
+- `notify_dashboard_update`
+- `notify_yolobox_preview`
+- `notify_dashboard_action_accepted`
+- `notify_dashboard_action_result`
+- `notify_error`
+
+Streambot may return action completion over `/ws/streambot` as either `dashboard_action_result` or `action_result`, carrying `request_id`, optional `section`/`action`, `success`, `data`, and `error`. The cloud forwards it to authorized panel viewers as `notify_dashboard_action_result`.
+
+## Dashboard layouts in user settings
+
+Cloud user settings now contain both the locale and the remote-dashboard layouts:
+
+```json
+{
+  "language": "de",
+  "dashboard_layouts": {
+    "<instance-uuid>": {
+      "order": ["music", "interactions", "macros"],
+      "hidden": ["giveaway"]
+    }
+  }
+}
+```
+
+`dashboard_layouts` is intentionally stored as an opaque JSON object. The remote frontend owns the exact per-instance layout schema and behavior (ordering, visibility and reset), while the cloud persists and synchronizes it between sessions/devices.
+
+Panel updates are WebSocket-only:
+
+```json
+{
+  "type": "update_user_settings",
+  "dashboard_layouts": {
+    "<instance-uuid>": {
+      "order": ["music", "interactions", "macros"],
+      "hidden": ["giveaway"]
+    }
+  }
+}
+```
+
+`language` and `dashboard_layouts` are independently optional, but at least one setting must be included. Successful changes emit `notify_user_settings_update` with the complete current settings object to all open panel sessions for that Twitch user.
