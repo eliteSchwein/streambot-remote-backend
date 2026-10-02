@@ -165,31 +165,9 @@ async fn oauth_start(
 
 fn route_name(kind: &str) -> &str { if kind == "message_bot" { "message-bot" } else { kind } }
 
-fn oauth_callback_uri(state: &AppState, headers: &HeaderMap, kind: &str) -> Result<String, AppError> {
-    let forwarded_proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
-    let forwarded_host = headers
-        .get("x-forwarded-host")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
-    let host = forwarded_host.or_else(|| headers.get("host").and_then(|v| v.to_str().ok()));
-
-    let origin = if let Some(host) = host {
-        let proto = forwarded_proto.unwrap_or_else(|| {
-            if state.config.app_public_url.starts_with("https://") { "https" } else { "http" }
-        });
-        format!("{proto}://{host}")
-    } else {
-        state.config.app_public_url.trim_end_matches('/').to_owned()
-    };
-
-    Ok(format!("{}/auth/{}/callback", origin.trim_end_matches('/'), route_name(kind)))
+fn oauth_callback_uri(state: &AppState, _headers: &HeaderMap, kind: &str) -> Result<String, AppError> {
+    let origin = state.config.app_public_url.trim_end_matches('/');
+    Ok(format!("{origin}/auth/{}/callback", route_name(kind)))
 }
 
 pub async fn bot_callback(State(state): State<AppState>, Query(query): Query<CallbackQuery>) -> Result<Response, AppError> {
