@@ -97,7 +97,7 @@ pub(crate) async fn websocket_dashboard_action(app: &AppState, session: &Session
         "payload":payload,
         "requested_by":{"twitch_user_id":session.twitch_user_id,"login":session.login}
     }).to_string();
-    sender.send(command).await.map_err(|_| AppError::BadRequest("Streambot instance disconnected".into()))?;
+    sender.send(axum::extract::ws::Message::Text(command.into())).await.map_err(|_| AppError::BadRequest("Streambot instance disconnected".into()))?;
     Ok(())
 }
 

@@ -166,6 +166,13 @@ pub(crate) async fn websocket_create_instance(state: &AppState, session: &crate:
 
 pub(crate) async fn websocket_delete_instance(state: &AppState, session: &crate::session::Session, streamer_id: Uuid, instance_id: Uuid) -> Result<(), AppError> {
     require_owner(session, streamer_id)?;
-    sqlx::query("DELETE FROM streambot_instances WHERE streamer_id=$1 AND id=$2").bind(streamer_id).bind(instance_id).execute(&state.db).await?;
+    let result = sqlx::query("DELETE FROM streambot_instances WHERE streamer_id=$1 AND id=$2")
+        .bind(streamer_id)
+        .bind(instance_id)
+        .execute(&state.db)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
     Ok(())
 }

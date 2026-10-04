@@ -399,3 +399,60 @@ Panel updates are WebSocket-only:
 ```
 
 `language` and `dashboard_layouts` are independently optional, but at least one setting must be included. Successful changes emit `notify_user_settings_update` with the complete current settings object to all open panel sessions for that Twitch user.
+
+## Per-instance panel WebSocket
+
+The remote panel now uses two authenticated browser WebSockets:
+
+- `GET /ws/user` for user/global state: profile, settings, streamer/instance list,
+  registration and access changes.
+- `GET /ws/instance/{instance_id}` for one instance's realtime state and actions.
+
+Opening an instance socket immediately emits:
+
+```json
+{"type":"connected","scope":"instance","instance_id":"..."}
+```
+
+followed by the current `notify_dashboard_snapshot` and, when cached, a
+`notify_yolobox_preview`.
+
+Subsequent StreamDing instance updates are delivered only on that instance
+socket, including:
+
+- `notify_dashboard_snapshot`
+- `notify_dashboard_update`
+- `notify_yolobox_preview`
+- `notify_instance_presence`
+- `notify_moderators_update`
+- `notify_dashboard_action_result`
+
+Dashboard actions must be sent on the matching instance socket:
+
+```json
+{
+  "type":"dashboard_action",
+  "section":"music",
+  "action":"next",
+  "payload":{},
+  "request_id":"optional-uuid"
+}
+```
+
+The instance id is taken from the WebSocket URL, so clients do not send an
+`instance_id` in each action anymore. Access is checked before upgrade and
+again for every action. When moderator access is revoked, the user's instance
+notification channel is detached immediately.
+
+Each connected instance panel socket owns an independent Tokio task and mpsc
+send queue. This isolates slow/noisy instance traffic instead of multiplexing
+all dashboard traffic through `/ws/user`.
+
+## Instance liveness
+
+Streambot websocket liveness is intentionally strict:
+
+- the cloud sends a websocket ping every 10 seconds,
+- an instance is disconnected after 25 seconds without any websocket response/message,
+- the Valkey `streambot:{instance_id}:online` safety key has a 30 second TTL,
+- clean disconnects and heartbeat timeouts delete the online key immediately and emit `notify_instance_presence` with `online:false`.

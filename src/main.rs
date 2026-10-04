@@ -28,7 +28,15 @@ async fn main() -> anyhow::Result<()> {
     sqlx::migrate!().run(&db).await?;
     let valkey = redis::Client::open(config.valkey_url.clone())?;
     let twitch = TwitchClient::new(config.twitch_client_id.clone(), config.twitch_client_secret.clone());
-    let state = AppState { config: config.clone(), db, valkey, twitch, streambot_connections: Arc::new(RwLock::new(HashMap::new())), user_connections: Arc::new(RwLock::new(HashMap::new())) };
+    let state = AppState {
+        config: config.clone(),
+        db,
+        valkey,
+        twitch,
+        streambot_connections: Arc::new(RwLock::new(HashMap::new())),
+        user_connections: Arc::new(RwLock::new(HashMap::new())),
+        instance_connections: Arc::new(RwLock::new(HashMap::new())),
+    };
 
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::exact(config.frontend_url.parse()?))
@@ -52,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/streambot/registration/status", get(routes::streambot::registration_status))
         .route("/ws/streambot", get(routes::streambot::ws_streambot))
         .route("/ws/user", get(routes::streambot::ws_user))
+        .route("/ws/instance/{instance_id}", get(routes::streambot::ws_instance))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
