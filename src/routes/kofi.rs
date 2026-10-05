@@ -83,8 +83,8 @@ fn normalize_relay_urls(value: Option<&Value>) -> Result<Vec<String>, AppError> 
             return Err(AppError::BadRequest("relay URL is empty or too long".into()));
         }
         let parsed = Url::parse(raw).map_err(|_| AppError::BadRequest("relay URL is invalid".into()))?;
-        if parsed.scheme() != "https" {
-            return Err(AppError::BadRequest("relay URLs must use https".into()));
+        if parsed.scheme() != "http" && parsed.scheme() != "https" {
+            return Err(AppError::BadRequest("relay URLs must use http or https".into()));
         }
         if !parsed.username().is_empty() || parsed.password().is_some() {
             return Err(AppError::BadRequest("relay URLs must not contain credentials".into()));
@@ -107,7 +107,9 @@ fn normalize_relay_urls(value: Option<&Value>) -> Result<Vec<String>, AppError> 
 
 async fn resolve_public_target(url: &Url) -> Result<Option<SocketAddr>, AppError> {
     let host = url.host_str().ok_or_else(|| AppError::BadRequest("relay URL must contain a host".into()))?;
-    let port = url.port_or_known_default().unwrap_or(443);
+    let port = url.port_or_known_default().ok_or_else(|| {
+        AppError::BadRequest("relay URL must use http or https".into())
+    })?;
 
     if let Ok(ip) = host.parse::<IpAddr>() {
         if is_forbidden_literal_ip(ip) {

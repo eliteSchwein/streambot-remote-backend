@@ -468,7 +468,7 @@ Save/update:
   "type": "save_kofi_settings",
   "streamer_id": "<streamer uuid>",
   "verification_token": "<Ko-fi verification token>",
-  "relay_urls": ["https://example.com/hooks/kofi"]
+  "relay_urls": ["https://example.com/hooks/kofi", "http://hooks.example.net/kofi"]
 }
 ```
 
@@ -493,7 +493,7 @@ Ko-fi should POST to the generated URL `/webhooks/kofi/{webhook_id}`. Valid Ko-f
 }
 ```
 
-Optional third-party relay URLs receive the sanitized Ko-fi event as an HTTPS JSON POST. Relay URLs are owner-managed, HTTPS-only, limited to 10 entries, and literal private/localhost targets are rejected.
+Optional third-party relay URLs receive the sanitized Ko-fi event as a JSON POST. Relay URLs are owner-managed, may use public HTTP or HTTPS, are limited to 10 entries, and localhost/private/link-local targets are rejected.
 
 ## Ko-fi generated webhook URL
 
