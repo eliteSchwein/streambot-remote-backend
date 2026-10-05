@@ -363,8 +363,9 @@ pub async fn webhook(
         return Err(AppError::Forbidden);
     }
 
-    // Keep the shared secret cloud-side. Instances and third-party relays receive
-    // the event itself, never Ko-fi's verification token.
+    // Keep the shared secret out of StreamDing instance events. Third-party relay
+    // targets intentionally receive the original Ko-fi payload unchanged so existing
+    // Ko-fi webhook consumers can perform their own verification-token checks.
     let mut sanitized = payload.clone();
     if let Some(obj) = sanitized.as_object_mut() {
         obj.remove("verification_token");
@@ -425,10 +426,12 @@ pub async fn webhook(
 
     let relay_urls: Vec<String> = serde_json::from_value(row.relay_urls).unwrap_or_default();
     if !relay_urls.is_empty() {
-        let relay_payload = event.get("data").cloned().unwrap_or(Value::Null);
+        // Forward the original Ko-fi payload (including verification_token) so
+        // downstream services can validate the webhook exactly as if Ko-fi had
+        // called them directly. Only StreamDing instance events are sanitized.
         for url in relay_urls {
-            let payload = relay_payload.clone();
-            tokio::spawn(relay_event(url, payload));
+            let relay_payload = payload.clone();
+            tokio::spawn(relay_event(url, relay_payload));
         }
     }
 
