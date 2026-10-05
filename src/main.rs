@@ -61,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/ws/streambot", get(routes::streambot::ws_streambot))
         .route("/ws/user", get(routes::streambot::ws_user))
         .route("/ws/instance/{instance_id}", get(routes::streambot::ws_instance))
+        .route("/webhooks/kofi/{webhook_id}", post(routes::kofi::webhook))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);

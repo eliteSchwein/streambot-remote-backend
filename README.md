@@ -456,3 +456,66 @@ Streambot websocket liveness is intentionally strict:
 - an instance is disconnected after 25 seconds without any websocket response/message,
 - the Valkey `streambot:{instance_id}:online` safety key has a 30 second TTL,
 - clean disconnects and heartbeat timeouts delete the online key immediately and emit `notify_instance_presence` with `online:false`.
+
+## Ko-fi webhook integration
+
+Ko-fi configuration is owner-only and is managed over `/ws/user`.
+
+Save/update:
+
+```json
+{
+  "type": "save_kofi_settings",
+  "streamer_id": "<streamer uuid>",
+  "verification_token": "<Ko-fi verification token>",
+  "relay_urls": ["https://example.com/hooks/kofi"]
+}
+```
+
+The verification token is required when enabling Ko-fi the first time and can be omitted on later relay-only edits. Ko-fi can only be enabled when the owner has at least one registered StreamDing instance. Moderators cannot configure it.
+
+Delete:
+
+```json
+{"type":"delete_kofi_settings","streamer_id":"<streamer uuid>"}
+```
+
+The panel receives `notify_kofi_settings_update` on connect and after every change. The response contains the generated public webhook URL but never returns the verification token.
+
+Ko-fi should POST to the generated URL `/webhooks/kofi/{webhook_id}`. Valid Ko-fi events are verified, deduplicated by `message_id`, stripped of `verification_token`, then sent to all currently connected instances owned by that streamer as:
+
+```json
+{
+  "type": "notify_kofi_event",
+  "streamer_id": "<streamer uuid>",
+  "received_at": "...",
+  "data": { "type": "Donation", "...": "..." }
+}
+```
+
+Optional third-party relay URLs receive the sanitized Ko-fi event as an HTTPS JSON POST. Relay URLs are owner-managed, HTTPS-only, limited to 10 entries, and literal private/localhost targets are rejected.
+
+## Ko-fi generated webhook URL
+
+For every owner/streamer with at least one linked streamer-owned instance, `/ws/user`
+automatically ensures a persistent Ko-fi integration row exists. The initial
+`notify_kofi_settings_update` therefore already contains a stable generated URL before
+the verification token is saved:
+
+```json
+{
+  "type": "notify_kofi_settings_update",
+  "integrations": [
+    {
+      "streamer_id": "...",
+      "webhook_id": "...",
+      "webhook_url": "https://cloud.streamding.dev/webhooks/kofi/<uuid>",
+      "configured": false,
+      "verification_token_configured": false,
+      "relay_urls": []
+    }
+  ]
+}
+```
+
+Saving `verification_token` activates the existing generated URL instead of replacing it.

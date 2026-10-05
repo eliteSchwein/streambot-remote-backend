@@ -19,6 +19,7 @@ use crate::{
     error::AppError,
     routes::{
         api::{websocket_create_instance, websocket_delete_instance, websocket_me, websocket_streamers, websocket_update_user_settings, websocket_user_settings},
+        kofi::{websocket_delete_kofi_settings, websocket_kofi_settings, websocket_save_kofi_settings},
         mod_panel::{valid_dashboard_section, websocket_dashboard, websocket_dashboard_action,
         websocket_instances},
     },
@@ -206,6 +207,18 @@ async fn handle_user_socket(state: AppState, socket: WebSocket, session: Session
     }
     if let Ok(instances) = websocket_instances(&state, &session).await {
         let _ = sender.send(Message::Text(json!({"type":"notify_instances_update","instances":instances}).to_string().into())).await;
+    }
+    if let Ok(integrations) = websocket_kofi_settings(&state, &session).await {
+        let data = integrations
+            .as_array()
+            .and_then(|items| items.first())
+            .cloned()
+            .unwrap_or(Value::Null);
+        let _ = sender.send(Message::Text(json!({
+            "type":"notify_kofi_settings_update",
+            "data":data,
+            "integrations":integrations
+        }).to_string().into())).await;
     }
     if let Ok(mut conn) = state.valkey.get_multiplexed_async_connection().await {
         let ids: Vec<String> = conn.smembers(format!("streambot_registration_user:{twitch_user_id}")).await.unwrap_or_default();
@@ -403,6 +416,42 @@ async fn handle_user_message(state: &AppState, session: &Session, text: &str) ->
             let settings = websocket_update_user_settings(state, session, language, dashboard_layouts).await?;
             Ok(Some(json!({"type":"notify_user_settings_update","settings":settings,"source":"mutation"})))
         }
+        "save_kofi_settings" => {
+            let streamer_id = parse_uuid_field(&value, "streamer_id")?;
+            let verification_token = value.get("verification_token").and_then(Value::as_str);
+            let relay_urls = value.get("relay_urls");
+            let integration = websocket_save_kofi_settings(
+                state,
+                session,
+                streamer_id,
+                verification_token,
+                relay_urls,
+            ).await?;
+            let integrations = websocket_kofi_settings(state, session).await?;
+            Ok(Some(json!({
+                "type":"notify_kofi_settings_update",
+                "data":integration,
+                "integrations":integrations,
+                "event":"saved"
+            })))
+        }
+        "delete_kofi_settings" => {
+            let streamer_id = parse_uuid_field(&value, "streamer_id")?;
+            websocket_delete_kofi_settings(state, session, streamer_id).await?;
+            let integrations = websocket_kofi_settings(state, session).await?;
+            let data = integrations
+                .as_array()
+                .and_then(|items| items.first())
+                .cloned()
+                .unwrap_or(Value::Null);
+            Ok(Some(json!({
+                "type":"notify_kofi_settings_update",
+                "data":data,
+                "integrations":integrations,
+                "deleted_streamer_id":streamer_id,
+                "event":"deleted"
+            })))
+        }
         "create_instance" => {
             let streamer_id = parse_uuid_field(&value, "streamer_id")?;
             let name = value.get("name").and_then(Value::as_str)
@@ -456,12 +505,14 @@ async fn handle_user_message(state: &AppState, session: &Session, text: &str) ->
             let settings = websocket_user_settings(state, session).await?;
             let streamers = websocket_streamers(state, session).await?;
             let instances = websocket_instances(state, session).await?;
+            let kofi_integrations = websocket_kofi_settings(state, session).await?;
             Ok(Some(json!({
                 "type":"notify_resync",
                 "user":user,
                 "settings":settings,
                 "streamers":streamers,
-                "instances":instances
+                "instances":instances,
+                "kofi_integrations":kofi_integrations
             })))
         }
         _ => Err(AppError::BadRequest("unknown user websocket message type".into())),
