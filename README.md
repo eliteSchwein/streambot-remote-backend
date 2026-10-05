@@ -493,7 +493,7 @@ Ko-fi should POST to the generated URL `/webhooks/kofi/{webhook_id}`. Valid Ko-f
 }
 ```
 
-Optional third-party relay URLs receive the sanitized Ko-fi event as a JSON POST. Relay URLs are owner-managed, may use public HTTP or HTTPS, are limited to 10 entries, and localhost/private/link-local targets are rejected.
+Optional third-party relay URLs receive the sanitized Ko-fi event as a JSON POST. Relay URLs are owner-managed, may use HTTP or HTTPS, are limited to 10 entries, and localhost/private/link-local literal targets are rejected. Hostnames are not DNS-resolved for validation, so split-DNS/public hostnames remain supported.
 
 ## Ko-fi generated webhook URL
 

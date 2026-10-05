@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr}};
+use std::{collections::HashMap, net::{IpAddr, Ipv4Addr, Ipv6Addr}};
 
 use axum::{
     Form, Json,
@@ -105,52 +105,17 @@ fn normalize_relay_urls(value: Option<&Value>) -> Result<Vec<String>, AppError> 
     Ok(output)
 }
 
-async fn resolve_public_target(url: &Url) -> Result<Option<SocketAddr>, AppError> {
-    let host = url.host_str().ok_or_else(|| AppError::BadRequest("relay URL must contain a host".into()))?;
-    let port = url.port_or_known_default().ok_or_else(|| {
-        AppError::BadRequest("relay URL must use http or https".into())
-    })?;
-
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_forbidden_literal_ip(ip) {
-            return Err(AppError::BadRequest("relay URL may not target a private/local address".into()));
-        }
-        return Ok(Some(SocketAddr::new(ip, port)));
-    }
-
-    let addresses = tokio::net::lookup_host((host, port)).await
-        .map_err(|_| AppError::BadRequest("relay URL host could not be resolved".into()))?
-        .collect::<Vec<_>>();
-    if addresses.is_empty() {
-        return Err(AppError::BadRequest("relay URL host could not be resolved".into()));
-    }
-    if addresses.iter().any(|addr| is_forbidden_literal_ip(addr.ip())) {
-        return Err(AppError::BadRequest("relay URL resolves to a private/local address".into()));
-    }
-    Ok(addresses.into_iter().next())
-}
-
 async fn relay_event(url: String, payload: Value) {
-    let parsed = match Url::parse(&url) {
-        Ok(parsed) => parsed,
-        Err(_) => return,
-    };
-    let host = match parsed.host_str() {
-        Some(host) => host.to_owned(),
-        None => return,
-    };
-    let target = match resolve_public_target(&parsed).await {
-        Ok(Some(target)) => target,
-        Ok(None) => return,
-        Err(error) => {
-            tracing::warn!(%url, error=%error, "blocked Ko-fi relay destination");
-            return;
-        }
-    };
+    // Relay hostnames are deliberately not resolved for validation here.
+    // This keeps split-DNS/public hostnames usable while normalize_relay_urls()
+    // still rejects localhost and private/local literal IP targets.
+    if normalize_relay_urls(Some(&json!([url.clone()]))).is_err() {
+        tracing::warn!(%url, "blocked Ko-fi relay destination");
+        return;
+    }
 
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
-        .resolve(&host, target)
         .build()
     {
         Ok(client) => client,
@@ -291,10 +256,6 @@ pub(crate) async fn websocket_save_kofi_settings(
             .and_then(|(_, _, value)| serde_json::from_value::<Vec<String>>(value.clone()).ok())
             .unwrap_or_default(),
     };
-    for relay in &relays {
-        let parsed = Url::parse(relay).map_err(|_| AppError::BadRequest("relay URL is invalid".into()))?;
-        resolve_public_target(&parsed).await?;
-    }
     let relay_json = serde_json::to_value(&relays).map_err(|e| AppError::Internal(e.into()))?;
     let webhook_id = existing.as_ref().map(|(id, _, _)| *id).unwrap_or_else(Uuid::new_v4);
 
