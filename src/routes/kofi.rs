@@ -125,10 +125,18 @@ async fn relay_event(url: String, payload: Value) {
         }
     };
 
+    let relay_data = match serde_json::to_string(&payload) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%url, error=?error, "failed to serialize Ko-fi relay payload");
+            return;
+        }
+    };
+
     match client
         .post(&url)
         .header("X-StreamDing-Webhook", "kofi")
-        .json(&payload)
+        .form(&[("data", relay_data)])
         .send()
         .await
     {
