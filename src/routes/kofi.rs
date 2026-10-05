@@ -144,7 +144,27 @@ async fn relay_event(url: String, payload: Value) {
             tracing::debug!(%url, status=%response.status(), "relayed Ko-fi webhook");
         }
         Ok(response) => {
-            tracing::warn!(%url, status=%response.status(), "Ko-fi relay returned non-success status");
+            let status = response.status();
+            let response_body = match response.text().await {
+                Ok(body) => {
+                    const MAX_LOG_BODY_BYTES: usize = 4096;
+                    if body.len() > MAX_LOG_BODY_BYTES {
+                        let mut truncated = body;
+                        truncated.truncate(MAX_LOG_BODY_BYTES);
+                        format!("{truncated}… [truncated]")
+                    } else {
+                        body
+                    }
+                }
+                Err(error) => format!("<failed to read response body: {error}>")
+            };
+
+            tracing::warn!(
+                %url,
+                %status,
+                response_body=%response_body,
+                "Ko-fi relay returned non-success status"
+            );
         }
         Err(error) => {
             tracing::warn!(%url, error=?error, "Ko-fi relay request failed");
