@@ -320,7 +320,7 @@ Client request/action messages include:
 - `request_instances`
 - `request_streamer_instances` (`streamer_id`)
 - `create_instance` (`streamer_id`, `name`)
-- `delete_instance` (`streamer_id`, `instance_id`)
+- `delete_instance` (`instance_id`)
 - `request_dashboard` (`instance_id`)
 - `request_dashboard_section` (`instance_id`, `section`)
 - `dashboard_action` (`instance_id`, `section`, `action`, `payload`, optional `request_id`)

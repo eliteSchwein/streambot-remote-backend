@@ -461,19 +461,18 @@ async fn handle_user_message(state: &AppState, session: &Session, text: &str) ->
             Ok(Some(json!({"type":"notify_instances_update","instances":instances,"created":instance,"event":"created"})))
         }
         "delete_instance" => {
-            let streamer_id = parse_uuid_field(&value, "streamer_id")?;
             let instance_id = parse_uuid_field(&value, "instance_id")?;
 
             // Capture moderators before deleting cache/state so their open panels can
-            // immediately remove the instance too. websocket_delete_instance itself
-            // enforces owner-only access.
+            // immediately remove the instance too. websocket_delete_instance resolves
+            // the owning streamer internally and enforces owner-only access.
             let moderators = load_moderator_map(state, instance_id).await.unwrap_or_else(|_| json!([]));
             let mut affected_users = moderator_ids(&moderators);
             affected_users.push(session.twitch_user_id.clone());
             affected_users.sort();
             affected_users.dedup();
 
-            websocket_delete_instance(state, session, streamer_id, instance_id).await?;
+            let streamer_id = websocket_delete_instance(state, session, instance_id).await?;
 
             let deleted = json!({
                 "type":"notify_instance_deleted",

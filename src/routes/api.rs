@@ -164,15 +164,31 @@ pub(crate) async fn websocket_create_instance(state: &AppState, session: &crate:
     Ok(serde_json::json!({"id":instance_id,"name":name,"token":token,"streamer_id":streamer_id}))
 }
 
-pub(crate) async fn websocket_delete_instance(state: &AppState, session: &crate::session::Session, streamer_id: Uuid, instance_id: Uuid) -> Result<(), AppError> {
+pub(crate) async fn websocket_delete_instance(
+    state: &AppState,
+    session: &crate::session::Session,
+    instance_id: Uuid,
+) -> Result<Uuid, AppError> {
+    let streamer_id: Uuid = sqlx::query_scalar(
+        "SELECT streamer_id FROM streambot_instances WHERE id=$1"
+    )
+        .bind(instance_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    // Only the owner of the streamer that owns this instance may delete it.
+    // Moderator access to the instance is intentionally not sufficient.
     require_owner(session, streamer_id)?;
-    let result = sqlx::query("DELETE FROM streambot_instances WHERE streamer_id=$1 AND id=$2")
-        .bind(streamer_id)
+
+    let result = sqlx::query("DELETE FROM streambot_instances WHERE id=$1")
         .bind(instance_id)
         .execute(&state.db)
         .await?;
+
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound);
     }
-    Ok(())
+
+    Ok(streamer_id)
 }
