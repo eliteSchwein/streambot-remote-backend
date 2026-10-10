@@ -27,7 +27,7 @@ use crate::{
     state::AppState,
 };
 
-const REGISTRATION_TTL_SECONDS: u64 = 600;
+const REGISTRATION_TTL_SECONDS: u64 = 30;
 const MAX_PIN_ATTEMPTS: i64 = 5;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -87,7 +87,7 @@ pub async fn registration_start(
     let _: () = conn.set_ex(&key, serde_json::to_string(&request).map_err(|e| AppError::Internal(e.into()))?, REGISTRATION_TTL_SECONDS).await?;
     let user_key = format!("streambot_registration_user:{twitch_user_id}");
     let _: usize = conn.sadd(&user_key, pairing_id.to_string()).await?;
-    let _: bool = conn.expire(&user_key, REGISTRATION_TTL_SECONDS as i64).await?;
+    let _: bool = conn.expire(&user_key, (REGISTRATION_TTL_SECONDS + 5) as i64).await?;
 
     notify_user(&state, &twitch_user_id, json!({
         "type": "notify_streambot_registration",
@@ -97,7 +97,18 @@ pub async fn registration_start(
         "twitch_login": canonical_login,
         "pin": pin,
         "expires_in": REGISTRATION_TTL_SECONDS,
+        "remaining_seconds": REGISTRATION_TTL_SECONDS,
+        "progress": 100,
     })).await;
+
+    spawn_registration_countdown(
+        state.clone(),
+        twitch_user_id.clone(),
+        pairing_id,
+        name.to_owned(),
+        canonical_login.clone(),
+        pin.clone(),
+    );
 
     tracing::info!(%pairing_id, name=%name, twitch_login=%twitch_login, "created PIN Streambot registration");
     Ok(Json(StartRegistrationResponse { pairing_id, twitch_login, expires_in: REGISTRATION_TTL_SECONDS }))
@@ -225,7 +236,23 @@ async fn handle_user_socket(state: AppState, socket: WebSocket, session: Session
         for id in ids {
             if let Ok(Some(raw)) = conn.get::<_, Option<String>>(format!("streambot_registration:{id}")).await {
                 if let Ok(req) = serde_json::from_str::<RegistrationRequest>(&raw) {
-                    let msg = json!({"type":"notify_streambot_registration","status":"pending","pairing_id":id,"name":req.name,"twitch_login":req.twitch_login,"pin":req.pin,"expires_in":REGISTRATION_TTL_SECONDS}).to_string();
+                    let remaining_seconds: u64 = conn.ttl(format!("streambot_registration:{id}"))
+                        .await
+                        .ok()
+                        .and_then(|ttl: i64| (ttl > 0).then_some(ttl as u64))
+                        .unwrap_or(0);
+                    let progress = registration_progress_percent(remaining_seconds);
+                    let msg = json!({
+                        "type":"notify_streambot_registration",
+                        "status":"pending",
+                        "pairing_id":id,
+                        "name":req.name,
+                        "twitch_login":req.twitch_login,
+                        "pin":req.pin,
+                        "expires_in":remaining_seconds,
+                        "remaining_seconds":remaining_seconds,
+                        "progress":progress
+                    }).to_string();
                     let _ = sender.send(Message::Text(msg.into())).await;
                 }
             }
@@ -456,9 +483,24 @@ async fn handle_user_message(state: &AppState, session: &Session, text: &str) ->
             let streamer_id = parse_uuid_field(&value, "streamer_id")?;
             let name = value.get("name").and_then(Value::as_str)
                 .ok_or_else(|| AppError::BadRequest("name is required".into()))?;
+
             let instance = websocket_create_instance(state, session, streamer_id, name).await?;
+
+            // Creation is intentionally emitted as two ordered notifications:
+            // 1. immediate creation event (also carries the one-time token)
+            // 2. freshly rebuilt canonical list that the frontend treats as authoritative
+            notify_user(state, &session.twitch_user_id, json!({
+                "type": "notify_instance_created",
+                "instance": instance
+            })).await;
+
             let instances = websocket_instances(state, session).await?;
-            Ok(Some(json!({"type":"notify_instances_update","instances":instances,"created":instance,"event":"created"})))
+            notify_user(state, &session.twitch_user_id, json!({
+                "type": "notify_instances_update",
+                "instances": instances
+            })).await;
+
+            Ok(None)
         }
         "delete_instance" => {
             let instance_id = parse_uuid_field(&value, "instance_id")?;
@@ -552,6 +594,88 @@ fn parse_uuid_field(value: &Value, field: &str) -> Result<Uuid, AppError> {
     let raw = value.get(field).and_then(Value::as_str)
         .ok_or_else(|| AppError::BadRequest(format!("{field} is required")))?;
     Uuid::parse_str(raw).map_err(|_| AppError::BadRequest(format!("{field} is invalid")))
+}
+
+fn registration_progress_percent(remaining_seconds: u64) -> u64 {
+    if REGISTRATION_TTL_SECONDS == 0 {
+        return 0;
+    }
+    ((remaining_seconds.min(REGISTRATION_TTL_SECONDS) * 100) / REGISTRATION_TTL_SECONDS).min(100)
+}
+
+fn spawn_registration_countdown(
+    state: AppState,
+    twitch_user_id: String,
+    pairing_id: Uuid,
+    name: String,
+    twitch_login: String,
+    pin: String,
+) {
+    tokio::spawn(async move {
+        let registration_key = format!("streambot_registration:{pairing_id}");
+        let user_key = format!("streambot_registration_user:{twitch_user_id}");
+        let pairing_id_string = pairing_id.to_string();
+
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        interval.tick().await;
+
+        loop {
+            interval.tick().await;
+
+            let mut conn = match state.valkey.get_multiplexed_async_connection().await {
+                Ok(conn) => conn,
+                Err(error) => {
+                    tracing::warn!(%pairing_id, error=?error, "failed to update registration countdown");
+                    continue;
+                }
+            };
+
+            let ttl: i64 = match conn.ttl(&registration_key).await {
+                Ok(ttl) => ttl,
+                Err(error) => {
+                    tracing::warn!(%pairing_id, error=?error, "failed to read registration countdown TTL");
+                    continue;
+                }
+            };
+
+            if ttl > 0 {
+                let remaining_seconds = ttl as u64;
+                notify_user(&state, &twitch_user_id, json!({
+                    "type": "notify_streambot_registration",
+                    "status": "pending",
+                    "pairing_id": pairing_id,
+                    "name": name,
+                    "twitch_login": twitch_login,
+                    "pin": pin,
+                    "expires_in": remaining_seconds,
+                    "remaining_seconds": remaining_seconds,
+                    "progress": registration_progress_percent(remaining_seconds),
+                })).await;
+                continue;
+            }
+
+            // Verification removes the pairing id from the user set before this
+            // task sees the registration key disappear. Natural expiry leaves it
+            // in the slightly longer-lived set, which lets us avoid sending an
+            // incorrect `expired` update after a successful verification.
+            let still_pending: bool = conn.sismember(&user_key, &pairing_id_string).await.unwrap_or(false);
+            if still_pending {
+                let _: Result<usize, _> = conn.srem(&user_key, &pairing_id_string).await;
+                notify_user(&state, &twitch_user_id, json!({
+                    "type": "notify_streambot_registration",
+                    "status": "expired",
+                    "pairing_id": pairing_id,
+                    "name": name,
+                    "twitch_login": twitch_login,
+                    "expires_in": 0,
+                    "remaining_seconds": 0,
+                    "progress": 0,
+                })).await;
+            }
+            break;
+        }
+    });
 }
 
 async fn notify_user(state: &AppState, twitch_user_id: &str, value: Value) {

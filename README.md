@@ -98,7 +98,7 @@ The response contains only `pairing_id`, `twitch_login`, and `expires_in`. The P
 2. The cloud sends the matching logged-in user's panel this WebSocket event:
 
 ```json
-{"type":"streambot_registration","status":"pending","pairing_id":"...","name":"Main Streambot","twitch_login":"eliteschw31n","pin":"123456","expires_in":600}
+{"type":"streambot_registration","status":"pending","pairing_id":"...","name":"Main Streambot","twitch_login":"eliteschw31n","pin":"123456","expires_in":30}
 ```
 
 The panel shows the six-digit PIN. The user types it into the local Streambot admin panel.
@@ -112,7 +112,7 @@ Content-Type: application/json
 {"pairing_id":"...","pin":"123456"}
 ```
 
-On success the response contains the permanent instance `token`, `instance_id`, and `streamer_id`. Store the token locally and use it for `/ws/streambot` and `/api/v1/instance-auth`. The PIN expires after 10 minutes and permits at most five attempts.
+On success the response contains the permanent instance `token`, `instance_id`, and `streamer_id`. Store the token locally and use it for `/ws/streambot` and `/api/v1/instance-auth`. The PIN expires after 30 seconds and permits at most five attempts.
 
 The panel receives a second `streambot_registration` event with `status: "completed"`. Pending registrations are replayed when `/ws/user` reconnects.
 
@@ -205,12 +205,12 @@ Registration is initiated by the local Streambot and verified by a human-visible
 
 1. The cloud panel user logs in normally through `/auth/login` and keeps `/ws/user` connected.
 2. Streambot calls `POST /api/v1/streambot/registration/start` with `{"name":"My Streambot","twitch_login":"channelname"}`.
-3. Cloud stores the pending registration in Valkey for 10 minutes and sends the six-digit PIN only to that Twitch user's `/ws/user` connections.
+3. Cloud stores the pending registration in Valkey for 30 seconds and sends the six-digit PIN only to that Twitch user's `/ws/user` connections.
 4. The panel shows the PIN. The user types it into the local Streambot admin panel.
 5. Streambot calls `POST /api/v1/streambot/registration/verify` with `{"pairing_id":"...","pin":"123456"}`.
 6. Cloud creates the durable `streambot_instances` record and returns the one-time-visible permanent instance token.
 
-The PIN is never returned from the registration start endpoint, is never stored in PostgreSQL, expires after 10 minutes, and is limited to five verification attempts.
+The PIN is never returned from the registration start endpoint, is never stored in PostgreSQL, expires after 30 seconds, and is limited to five verification attempts.
 
 ## Cached remote dashboard
 
@@ -352,6 +352,16 @@ Notable notifications include:
 - `notify_streamers_update`
 - `notify_instances_update`
 - `notify_instance_created`
+
+Creation notification order for `create_instance`:
+
+```text
+notify_instance_created
+notify_instances_update   # freshly rebuilt canonical list
+```
+
+The frontend may use `notify_instance_created` for immediate feedback, but must treat the following `notify_instances_update` as authoritative.
+
 - `notify_instance_presence`
 - `notify_instance_access_granted`
 - `notify_instance_access_revoked`
