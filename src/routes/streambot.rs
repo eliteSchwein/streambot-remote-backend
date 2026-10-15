@@ -340,7 +340,7 @@ async fn handle_instance_socket(
     }
 
     let _ = sender.send(Message::Text(json!({
-        "type":"notify_dashboard_snapshot",
+        "type":"snapshot",
         "data":initial_dashboard
     }).to_string().into())).await;
 
@@ -969,8 +969,8 @@ async fn handle_streambot_message(
             // {type:"update",method:"notify_*",data:...} deltas. Legacy dashboard
             // snapshots remain supported during rollout.
             let dashboard = data.get("dashboard").unwrap_or(&data);
-            let mut changed_sections: Vec<String> = Vec::new();
-            let mut meta_changed = false;
+            let mut changed_sections: Vec<(String, Value)> = Vec::new();
+            let mut meta_delta = serde_json::Map::new();
 
             if let Value::Object(map) = dashboard {
                 for (key, section_data) in map {
@@ -980,35 +980,50 @@ async fn handle_streambot_message(
                         cloud_notify_method_section(key)
                     };
                     let Some(section) = section else { continue; };
-                    if cache_dashboard_section_if_changed(&mut conn, instance_id, section, section_data).await? {
-                        changed_sections.push(section.to_owned());
+                    if let Some(delta) = cache_dashboard_full_with_delta(
+                        &mut conn,
+                        instance_id,
+                        section,
+                        section_data,
+                    ).await? {
+                        changed_sections.push((section.to_owned(), delta));
                     }
                 }
 
                 if let Some(version) = map.get("version") {
-                    meta_changed |= cache_json_value_if_changed(
-                        &mut conn,
-                        format!("streambot:{instance_id}:dashboard:version"),
-                        version,
-                    ).await?;
+                    let key = format!("streambot:{instance_id}:dashboard:version");
+                    if let Some(delta) = cache_json_full_with_delta(&mut conn, key, version).await? {
+                        meta_delta.insert("version".into(), delta);
+                    }
                 }
                 if let Some(connections) = map.get("connections") {
-                    meta_changed |= cache_json_value_if_changed(
-                        &mut conn,
-                        format!("streambot:{instance_id}:dashboard:connections"),
-                        connections,
-                    ).await?;
+                    let key = format!("streambot:{instance_id}:dashboard:connections");
+                    if let Some(delta) = cache_json_full_with_delta(&mut conn, key, connections).await? {
+                        meta_delta.insert("connections".into(), delta);
+                    }
                 }
             }
 
-            if !changed_sections.is_empty() || meta_changed {
+            if !changed_sections.is_empty() || !meta_delta.is_empty() {
                 let updated_at = chrono::Utc::now().to_rfc3339();
                 let _: () = conn.set(format!("streambot:{instance_id}:dashboard:updated_at"), &updated_at).await?;
-                for section in changed_sections {
-                    notify_dashboard_viewers(state, streamer_id, instance_id, Some(&section)).await;
+                for (section, delta) in changed_sections {
+                    notify_cloud_delta_viewers(
+                        state,
+                        instance_id,
+                        section_notify_method(&section),
+                        &section,
+                        delta,
+                        &updated_at,
+                    ).await;
                 }
-                if meta_changed {
-                    notify_dashboard_meta_viewers(state, instance_id).await;
+                if !meta_delta.is_empty() {
+                    notify_dashboard_meta_delta(
+                        state,
+                        instance_id,
+                        Value::Object(meta_delta),
+                        &updated_at,
+                    ).await;
                 }
             }
         }
@@ -1018,9 +1033,17 @@ async fn handle_streambot_message(
                 return Err(AppError::BadRequest("unknown dashboard section".into()));
             }
             let data = value.get("data").cloned().unwrap_or(Value::Null);
-            if cache_dashboard_section_if_changed(&mut conn, instance_id, section, &data).await? {
-                let _: () = conn.set(format!("streambot:{instance_id}:dashboard:updated_at"), chrono::Utc::now().to_rfc3339()).await?;
-                notify_dashboard_viewers(state, streamer_id, instance_id, Some(section)).await;
+            if let Some(delta) = cache_dashboard_full_with_delta(&mut conn, instance_id, section, &data).await? {
+                let updated_at = chrono::Utc::now().to_rfc3339();
+                let _: () = conn.set(format!("streambot:{instance_id}:dashboard:updated_at"), &updated_at).await?;
+                notify_cloud_delta_viewers(
+                    state,
+                    instance_id,
+                    section_notify_method(section),
+                    section,
+                    delta,
+                    &updated_at,
+                ).await;
             }
         }
         "update" => {
@@ -1028,20 +1051,39 @@ async fn handle_streambot_message(
             if method == "notify_music_cava" {
                 // CAVA is intentionally never mirrored through the cloud websocket.
             } else if let Some(section) = cloud_notify_method_section(method) {
-                let data = value.get("data").cloned().unwrap_or(Value::Null);
-                if cache_dashboard_section_if_changed(&mut conn, instance_id, section, &data).await? {
-                    let _: () = conn.set(format!("streambot:{instance_id}:dashboard:updated_at"), chrono::Utc::now().to_rfc3339()).await?;
-                    notify_dashboard_viewers(state, streamer_id, instance_id, Some(section)).await;
+                let incoming_delta = value.get("data").cloned().unwrap_or(Value::Null);
+
+                if let Some(delta) = cache_dashboard_delta(
+                    &mut conn,
+                    instance_id,
+                    section,
+                    &incoming_delta,
+                ).await? {
+                    let updated_at = chrono::Utc::now().to_rfc3339();
+                    let _: () = conn.set(format!("streambot:{instance_id}:dashboard:updated_at"), &updated_at).await?;
+
+                    notify_cloud_delta_viewers(
+                        state,
+                        instance_id,
+                        method,
+                        section,
+                        delta,
+                        &updated_at,
+                    ).await;
                 }
             } else if method == "notify_connections_update" {
-                let data = value.get("data").cloned().unwrap_or(Value::Null);
-                if cache_json_value_if_changed(
-                    &mut conn,
-                    format!("streambot:{instance_id}:dashboard:connections"),
-                    &data,
-                ).await? {
-                    let _: () = conn.set(format!("streambot:{instance_id}:dashboard:updated_at"), chrono::Utc::now().to_rfc3339()).await?;
-                    notify_dashboard_meta_viewers(state, instance_id).await;
+                let incoming_delta = value.get("data").cloned().unwrap_or(Value::Null);
+                let key = format!("streambot:{instance_id}:dashboard:connections");
+                if let Some(delta) = cache_json_delta(&mut conn, key, &incoming_delta).await? {
+                    let updated_at = chrono::Utc::now().to_rfc3339();
+                    let _: () = conn.set(format!("streambot:{instance_id}:dashboard:updated_at"), &updated_at).await?;
+                    notify_instance(state, instance_id, json!({
+                        "type":"update",
+                        "method":"notify_connections_update",
+                        "instance_id":instance_id,
+                        "data":delta,
+                        "updated_at":updated_at
+                    })).await;
                 }
             } else {
                 tracing::trace!(%instance_id, %method, "ignoring unregistered cloud update method");
@@ -1128,6 +1170,22 @@ fn cloud_notify_method_section(method: &str) -> Option<&'static str> {
     }
 }
 
+fn section_notify_method(section: &str) -> &'static str {
+    match section {
+        "music" => "notify_music_update",
+        "giveaway" => "notify_giveaway_update",
+        "interactions" => "notify_interactions_update",
+        "auto_macros" => "notify_auto_macros_update",
+        "macros" => "notify_macros_update",
+        "channel_points" => "notify_channel_points_update",
+        "rotating_scene" => "notify_rotating_scene_update",
+        "audio" => "notify_audio_update",
+        "obs" => "notify_obs_update",
+        "yolobox" => "notify_yolobox_update",
+        _ => "notify_dashboard_update",
+    }
+}
+
 async fn cache_dashboard_section_if_changed(
     conn: &mut redis::aio::MultiplexedConnection,
     instance_id: Uuid,
@@ -1157,6 +1215,172 @@ async fn cache_json_value_if_changed(
     }
     let _: () = conn.set(key, serialized).await?;
     Ok(true)
+}
+
+async fn cache_json_full_with_delta(
+    conn: &mut redis::aio::MultiplexedConnection,
+    key: String,
+    full_value: &Value,
+) -> Result<Option<Value>, AppError> {
+    let old_raw: Option<String> = conn.get(&key).await?;
+    let old_value = old_raw
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .unwrap_or(Value::Null);
+
+    let delta = changed_key_delta_full(&old_value, full_value);
+    let serialized = serde_json::to_string(full_value).map_err(|e| AppError::Internal(e.into()))?;
+    let _: () = conn.set(key, serialized).await?;
+    Ok(delta)
+}
+
+async fn cache_dashboard_full_with_delta(
+    conn: &mut redis::aio::MultiplexedConnection,
+    instance_id: Uuid,
+    section: &str,
+    full_value: &Value,
+) -> Result<Option<Value>, AppError> {
+    let key = format!("streambot:{instance_id}:dashboard:{section}");
+    let old_raw: Option<String> = conn.get(&key).await?;
+    let old_value = old_raw
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .unwrap_or(Value::Null);
+
+    let sanitized = sanitize_dashboard_section(section, full_value);
+    let delta = changed_key_delta_full(&old_value, &sanitized);
+
+    let serialized = serde_json::to_string(&sanitized).map_err(|e| AppError::Internal(e.into()))?;
+    let _: () = conn.set(key, serialized).await?;
+    Ok(delta)
+}
+
+async fn cache_dashboard_delta(
+    conn: &mut redis::aio::MultiplexedConnection,
+    instance_id: Uuid,
+    section: &str,
+    incoming_delta: &Value,
+) -> Result<Option<Value>, AppError> {
+    let key = format!("streambot:{instance_id}:dashboard:{section}");
+    let old_raw: Option<String> = conn.get(&key).await?;
+    let old_value = old_raw
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .unwrap_or(Value::Null);
+
+    let sanitized_delta = sanitize_dashboard_section(section, incoming_delta);
+    let Some(actual_delta) = changed_key_delta(&old_value, &sanitized_delta) else {
+        return Ok(None);
+    };
+
+    let mut merged = old_value;
+    apply_changed_key_delta(&mut merged, &actual_delta);
+
+    let serialized = serde_json::to_string(&merged).map_err(|e| AppError::Internal(e.into()))?;
+    let _: () = conn.set(key, serialized).await?;
+    Ok(Some(actual_delta))
+}
+
+async fn cache_json_delta(
+    conn: &mut redis::aio::MultiplexedConnection,
+    key: String,
+    incoming_delta: &Value,
+) -> Result<Option<Value>, AppError> {
+    let old_raw: Option<String> = conn.get(&key).await?;
+    let old_value = old_raw
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .unwrap_or(Value::Null);
+
+    let Some(actual_delta) = changed_key_delta(&old_value, incoming_delta) else {
+        return Ok(None);
+    };
+
+    let mut merged = old_value;
+    apply_changed_key_delta(&mut merged, &actual_delta);
+
+    let serialized = serde_json::to_string(&merged).map_err(|e| AppError::Internal(e.into()))?;
+    let _: () = conn.set(key, serialized).await?;
+    Ok(Some(actual_delta))
+}
+
+fn changed_key_delta(current: &Value, incoming: &Value) -> Option<Value> {
+    match incoming {
+        Value::Object(incoming_map) => {
+            let current_map = current.as_object();
+            let mut out = serde_json::Map::new();
+
+            for (key, incoming_value) in incoming_map {
+                let current_value = current_map
+                    .and_then(|map| map.get(key))
+                    .unwrap_or(&Value::Null);
+
+                if let Some(delta) = changed_key_delta(current_value, incoming_value) {
+                    out.insert(key.clone(), delta);
+                }
+            }
+
+            if out.is_empty() { None } else { Some(Value::Object(out)) }
+        }
+        _ if current == incoming => None,
+        _ => Some(incoming.clone()),
+    }
+}
+
+fn changed_key_delta_full(current: &Value, next: &Value) -> Option<Value> {
+    match (current, next) {
+        (Value::Object(current_map), Value::Object(next_map)) => {
+            let mut out = serde_json::Map::new();
+
+            for (key, next_value) in next_map {
+                let current_value = current_map.get(key).unwrap_or(&Value::Null);
+                if let Some(delta) = changed_key_delta_full(current_value, next_value) {
+                    out.insert(key.clone(), delta);
+                }
+            }
+
+            for key in current_map.keys() {
+                if !next_map.contains_key(key) {
+                    out.insert(key.clone(), Value::Null);
+                }
+            }
+
+            if out.is_empty() { None } else { Some(Value::Object(out)) }
+        }
+        _ if current == next => None,
+        _ => Some(next.clone()),
+    }
+}
+
+fn apply_changed_key_delta(target: &mut Value, delta: &Value) {
+    match delta {
+        Value::Object(delta_map) => {
+            if !target.is_object() {
+                *target = Value::Object(serde_json::Map::new());
+            }
+
+            let target_map = target.as_object_mut().expect("target converted to object");
+            for (key, delta_value) in delta_map {
+                if delta_value.is_null() {
+                    target_map.remove(key);
+                    continue;
+                }
+
+                match delta_value {
+                    Value::Object(_) => {
+                        let target_value = target_map
+                            .entry(key.clone())
+                            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                        apply_changed_key_delta(target_value, delta_value);
+                    }
+                    _ => {
+                        target_map.insert(key.clone(), delta_value.clone());
+                    }
+                }
+            }
+        }
+        _ => *target = delta.clone(),
+    }
 }
 
 pub fn moderator_map_contains(value: &Value, twitch_user_id: &str) -> bool {
@@ -1191,6 +1415,10 @@ fn sanitize_dashboard_section(section: &str, value: &Value) -> Value {
             let Some(macros) = value.as_object() else { return json!({}); };
             let mut out = serde_json::Map::new();
             for (key, macro_value) in macros {
+                if macro_value.is_null() {
+                    out.insert(key.clone(), Value::Null);
+                    continue;
+                }
                 let name = macro_value.get("name").and_then(Value::as_str).unwrap_or(key);
                 out.insert(key.clone(), json!({ "name": name }));
             }
@@ -1280,18 +1508,37 @@ async fn notify_dashboard_viewers(state: &AppState, _streamer_id: Uuid, instance
 }
 
 
-async fn notify_dashboard_meta_viewers(state: &AppState, instance_id: Uuid) {
-    let mut conn = match state.valkey.get_multiplexed_async_connection().await { Ok(c) => c, Err(_) => return };
-    let updated_at: Option<String> = conn.get(format!("streambot:{instance_id}:dashboard:updated_at")).await.ok().flatten();
-    let version: Option<String> = conn.get(format!("streambot:{instance_id}:dashboard:version")).await.ok().flatten();
-    let connections_raw: Option<String> = conn.get(format!("streambot:{instance_id}:dashboard:connections")).await.ok().flatten();
-    let connections = connections_raw.and_then(|v| serde_json::from_str::<Value>(&v).ok()).unwrap_or(Value::Null);
+
+async fn notify_cloud_delta_viewers(
+    state: &AppState,
+    instance_id: Uuid,
+    method: &str,
+    section: &str,
+    data: Value,
+    updated_at: &str,
+) {
     notify_instance(state, instance_id, json!({
-        "type":"notify_dashboard_meta_update",
+        "type":"update",
+        "method":method,
         "instance_id":instance_id,
-        "updated_at":updated_at,
-        "version":version,
-        "connections":connections
+        "section":section,
+        "data":data,
+        "updated_at":updated_at
+    })).await;
+}
+
+async fn notify_dashboard_meta_delta(
+    state: &AppState,
+    instance_id: Uuid,
+    data: Value,
+    updated_at: &str,
+) {
+    notify_instance(state, instance_id, json!({
+        "type":"update",
+        "method":"notify_dashboard_meta_update",
+        "instance_id":instance_id,
+        "data":data,
+        "updated_at":updated_at
     })).await;
 }
 
