@@ -319,7 +319,7 @@ async fn handle_instance_socket(
 ) {
     let twitch_user_id = session.twitch_user_id.clone();
     let (mut sender, mut receiver) = socket.split();
-    let (tx, mut rx) = mpsc::channel::<String>(64);
+    let (tx, mut rx) = mpsc::channel::<String>(16);
 
     state.instance_connections.write().await
         .entry(instance_id)
@@ -922,91 +922,95 @@ async fn handle_streambot_message(
         "moderators" => {
             let moderators = value.get("moderators").cloned().unwrap_or_else(|| json!([]));
             let old_raw: Option<String> = conn.get(format!("streambot:{instance_id}:moderators")).await?;
-            let old_value = old_raw.and_then(|raw| serde_json::from_str::<Value>(&raw).ok()).unwrap_or_else(|| json!([]));
-            let old_ids = moderator_ids(&old_value);
-            let new_ids = moderator_ids(&moderators);
-            let _: () = conn.set(
-                format!("streambot:{instance_id}:moderators"),
-                serde_json::to_string(&moderators).map_err(|e| AppError::Internal(e.into()))?,
-            ).await?;
+            let old_value = old_raw.as_deref().and_then(|raw| serde_json::from_str::<Value>(raw).ok()).unwrap_or_else(|| json!([]));
+            if old_value != moderators {
+                let old_ids = moderator_ids(&old_value);
+                let new_ids = moderator_ids(&moderators);
+                let _: () = conn.set(
+                    format!("streambot:{instance_id}:moderators"),
+                    serde_json::to_string(&moderators).map_err(|e| AppError::Internal(e.into()))?,
+                ).await?;
 
-            let owner: Option<String> = sqlx::query_scalar("SELECT twitch_user_id FROM streamers WHERE id=$1")
-                .bind(streamer_id).fetch_optional(&state.db).await?;
-            let mut recipients = old_ids.clone(); recipients.extend(new_ids.clone());
-            if let Some(owner) = owner.clone() { recipients.push(owner); }
-            notify_users(state, recipients, json!({
-                "type":"notify_moderators_update",
-                "instance_id":instance_id,
-                "moderators":moderators
-            })).await;
-            notify_instance(state, instance_id, json!({
-                "type":"notify_moderators_update",
-                "instance_id":instance_id,
-                "moderators":moderators
-            })).await;
+                let owner: Option<String> = sqlx::query_scalar("SELECT twitch_user_id FROM streamers WHERE id=$1")
+                    .bind(streamer_id).fetch_optional(&state.db).await?;
+                let mut recipients = old_ids.clone(); recipients.extend(new_ids.clone());
+                if let Some(owner) = owner.clone() { recipients.push(owner); }
+                notify_users(state, recipients, json!({
+                    "type":"notify_moderators_update",
+                    "instance_id":instance_id,
+                    "moderators":moderators
+                })).await;
+                notify_instance(state, instance_id, json!({
+                    "type":"notify_moderators_update",
+                    "instance_id":instance_id,
+                    "moderators":moderators
+                })).await;
 
-            for id in new_ids.iter().filter(|id| !old_ids.contains(id)) {
-                notify_user(state, id, json!({"type":"notify_instance_access_granted","instance_id":instance_id,"streamer_id":streamer_id,"role":"mod"})).await;
+                for id in new_ids.iter().filter(|id| !old_ids.contains(id)) {
+                    notify_user(state, id, json!({"type":"notify_instance_access_granted","instance_id":instance_id,"streamer_id":streamer_id,"role":"mod"})).await;
+                }
+                for id in old_ids.iter().filter(|id| !new_ids.contains(id)) {
+                    notify_user(state, id, json!({"type":"notify_instance_access_revoked","instance_id":instance_id,"streamer_id":streamer_id})).await;
+                    revoke_instance_user(state, instance_id, id).await;
+                }
+                tracing::debug!(%instance_id, "updated Valkey moderator map");
             }
-            for id in old_ids.iter().filter(|id| !new_ids.contains(id)) {
-                notify_user(state, id, json!({"type":"notify_instance_access_revoked","instance_id":instance_id,"streamer_id":streamer_id})).await;
-                revoke_instance_user(state, instance_id, id).await;
-            }
-            tracing::debug!(%instance_id, "updated Valkey moderator map");
         }
-        "snapshot" | "state" => {
+        "snapshot" | "state" | "dashboard_snapshot" => {
             let data = value.get("data").cloned().unwrap_or(Value::Null);
-            let _: () = conn.set(
-                format!("streambot:{instance_id}:panel_state"),
-                serde_json::to_string(&data).map_err(|e| AppError::Internal(e.into()))?,
-            ).await?;
+            let panel_state_key = format!("streambot:{instance_id}:panel_state");
+            let panel_serialized = serde_json::to_string(&data).map_err(|e| AppError::Internal(e.into()))?;
+            let old_panel: Option<String> = conn.get(&panel_state_key).await?;
+            if old_panel.as_deref() != Some(panel_serialized.as_str()) {
+                let _: () = conn.set(&panel_state_key, &panel_serialized).await?;
+            }
 
-            // Streambot v2 sends a dedicated, already-trimmed remote dashboard under
-            // data.dashboard. Prefer that shape over the legacy top-level/status payload.
+            // New Streambot cloud protocol: one full snapshot first, then generic
+            // {type:"update",method:"notify_*",data:...} deltas. Legacy dashboard
+            // snapshots remain supported during rollout.
             let dashboard = data.get("dashboard").unwrap_or(&data);
+            let mut changed_sections: Vec<String> = Vec::new();
+            let mut meta_changed = false;
+
             if let Value::Object(map) = dashboard {
-                for (section, section_data) in map {
-                    if valid_dashboard_section(section) {
-                        let sanitized = sanitize_dashboard_section(section, section_data);
-                        let _: () = conn.set(
-                            format!("streambot:{instance_id}:dashboard:{section}"),
-                            serde_json::to_string(&sanitized).map_err(|e| AppError::Internal(e.into()))?,
-                        ).await?;
+                for (key, section_data) in map {
+                    let section = if valid_dashboard_section(key) {
+                        Some(key.as_str())
+                    } else {
+                        cloud_notify_method_section(key)
+                    };
+                    let Some(section) = section else { continue; };
+                    if cache_dashboard_section_if_changed(&mut conn, instance_id, section, section_data).await? {
+                        changed_sections.push(section.to_owned());
                     }
                 }
 
                 if let Some(version) = map.get("version") {
-                    let _: () = conn.set(
+                    meta_changed |= cache_json_value_if_changed(
+                        &mut conn,
                         format!("streambot:{instance_id}:dashboard:version"),
-                        version.to_string(),
+                        version,
                     ).await?;
                 }
                 if let Some(connections) = map.get("connections") {
-                    let _: () = conn.set(
+                    meta_changed |= cache_json_value_if_changed(
+                        &mut conn,
                         format!("streambot:{instance_id}:dashboard:connections"),
-                        serde_json::to_string(connections).map_err(|e| AppError::Internal(e.into()))?,
+                        connections,
                     ).await?;
                 }
             }
-            let updated_at = dashboard.get("updated_at")
-                .map(Value::to_string)
-                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-            let _: () = conn.set(format!("streambot:{instance_id}:dashboard:updated_at"), updated_at).await?;
-            notify_dashboard_viewers(state, streamer_id, instance_id, None).await;
-        }
-        "dashboard_snapshot" => {
-            let data = value.get("data").cloned().unwrap_or(Value::Null);
-            let map = data.as_object().ok_or_else(|| AppError::BadRequest("dashboard_snapshot.data must be an object".into()))?;
-            for (section, section_data) in map {
-                if !valid_dashboard_section(section) { continue; }
-                let sanitized = sanitize_dashboard_section(section, section_data);
-                let _: () = conn.set(
-                    format!("streambot:{instance_id}:dashboard:{section}"),
-                    serde_json::to_string(&sanitized).map_err(|e| AppError::Internal(e.into()))?,
-                ).await?;
+
+            if !changed_sections.is_empty() || meta_changed {
+                let updated_at = chrono::Utc::now().to_rfc3339();
+                let _: () = conn.set(format!("streambot:{instance_id}:dashboard:updated_at"), &updated_at).await?;
+                for section in changed_sections {
+                    notify_dashboard_viewers(state, streamer_id, instance_id, Some(&section)).await;
+                }
+                if meta_changed {
+                    notify_dashboard_meta_viewers(state, instance_id).await;
+                }
             }
-            let _: () = conn.set(format!("streambot:{instance_id}:dashboard:updated_at"), chrono::Utc::now().to_rfc3339()).await?;
-            notify_dashboard_viewers(state, streamer_id, instance_id, None).await;
         }
         "dashboard_update" => {
             let section = value.get("section").and_then(Value::as_str).unwrap_or("");
@@ -1014,13 +1018,34 @@ async fn handle_streambot_message(
                 return Err(AppError::BadRequest("unknown dashboard section".into()));
             }
             let data = value.get("data").cloned().unwrap_or(Value::Null);
-            let sanitized = sanitize_dashboard_section(section, &data);
-            let _: () = conn.set(
-                format!("streambot:{instance_id}:dashboard:{section}"),
-                serde_json::to_string(&sanitized).map_err(|e| AppError::Internal(e.into()))?,
-            ).await?;
-            let _: () = conn.set(format!("streambot:{instance_id}:dashboard:updated_at"), chrono::Utc::now().to_rfc3339()).await?;
-            notify_dashboard_viewers(state, streamer_id, instance_id, Some(section)).await;
+            if cache_dashboard_section_if_changed(&mut conn, instance_id, section, &data).await? {
+                let _: () = conn.set(format!("streambot:{instance_id}:dashboard:updated_at"), chrono::Utc::now().to_rfc3339()).await?;
+                notify_dashboard_viewers(state, streamer_id, instance_id, Some(section)).await;
+            }
+        }
+        "update" => {
+            let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+            if method == "notify_music_cava" {
+                // CAVA is intentionally never mirrored through the cloud websocket.
+            } else if let Some(section) = cloud_notify_method_section(method) {
+                let data = value.get("data").cloned().unwrap_or(Value::Null);
+                if cache_dashboard_section_if_changed(&mut conn, instance_id, section, &data).await? {
+                    let _: () = conn.set(format!("streambot:{instance_id}:dashboard:updated_at"), chrono::Utc::now().to_rfc3339()).await?;
+                    notify_dashboard_viewers(state, streamer_id, instance_id, Some(section)).await;
+                }
+            } else if method == "notify_connections_update" {
+                let data = value.get("data").cloned().unwrap_or(Value::Null);
+                if cache_json_value_if_changed(
+                    &mut conn,
+                    format!("streambot:{instance_id}:dashboard:connections"),
+                    &data,
+                ).await? {
+                    let _: () = conn.set(format!("streambot:{instance_id}:dashboard:updated_at"), chrono::Utc::now().to_rfc3339()).await?;
+                    notify_dashboard_meta_viewers(state, instance_id).await;
+                }
+            } else {
+                tracing::trace!(%instance_id, %method, "ignoring unregistered cloud update method");
+            }
         }
         "yolobox_preview" => {
             let mime = value.get("mime").and_then(Value::as_str).unwrap_or("image/jpeg");
@@ -1032,10 +1057,20 @@ async fn handle_streambot_message(
             if bytes.len() > 2_000_000 {
                 return Err(AppError::BadRequest("Yolobox preview exceeds 2 MB".into()));
             }
-            let preview_b64 = encoded.to_owned();
-            let _: () = conn.set_ex(format!("streambot:{instance_id}:yolobox_preview:data"), bytes, 30).await?;
-            let _: () = conn.set_ex(format!("streambot:{instance_id}:yolobox_preview:mime"), mime, 30).await?;
-            notify_yolobox_preview_viewers(state, streamer_id, instance_id, mime, &preview_b64).await;
+
+            // Avoid re-forwarding identical preview frames. The frontend queue uses
+            // try_send as well, so slow clients drop transient frames instead of
+            // building unbounded backpressure.
+            let hash = sha256(encoded);
+            let hash_key = format!("streambot:{instance_id}:yolobox_preview:hash");
+            let old_hash: Option<String> = conn.get(&hash_key).await?;
+            if old_hash.as_deref() != Some(hash.as_str()) {
+                let preview_b64 = encoded.to_owned();
+                let _: () = conn.set_ex(format!("streambot:{instance_id}:yolobox_preview:data"), bytes, 30).await?;
+                let _: () = conn.set_ex(format!("streambot:{instance_id}:yolobox_preview:mime"), mime, 30).await?;
+                let _: () = conn.set_ex(hash_key, hash, 30).await?;
+                notify_yolobox_preview_viewers(state, streamer_id, instance_id, mime, &preview_b64).await;
+            }
         }
         "dashboard_action_result" | "action_result" => {
             let request_id = value.get("request_id").cloned().unwrap_or(Value::Null);
@@ -1055,6 +1090,10 @@ async fn handle_streambot_message(
                 "error":error
             })).await;
         }
+        "cava" | "music_cava" | "notify_music_cava" => {
+            // High-frequency CAVA has its own local /cava/<target> websocket and
+            // must never consume cloud bandwidth or Valkey writes.
+        }
         "hello" | "heartbeat" => {}
         _ => {
             let _: () = conn.set(
@@ -1071,6 +1110,53 @@ async fn handle_streambot_message(
         .execute(&state.db)
         .await?;
     Ok(())
+}
+
+fn cloud_notify_method_section(method: &str) -> Option<&'static str> {
+    match method {
+        "notify_music_update" | "music" => Some("music"),
+        "notify_giveaway_update" | "giveaway" => Some("giveaway"),
+        "notify_interactions_update" | "interactions" => Some("interactions"),
+        "notify_auto_macros_update" | "auto_macros" => Some("auto_macros"),
+        "notify_macros_update" | "macros" => Some("macros"),
+        "notify_channel_points_update" | "channel_points" => Some("channel_points"),
+        "notify_rotating_scene_update" | "rotating_scene" => Some("rotating_scene"),
+        "notify_audio_update" | "audio" => Some("audio"),
+        "notify_obs_update" | "obs" => Some("obs"),
+        "notify_yolobox_update" | "yolobox" => Some("yolobox"),
+        _ => None,
+    }
+}
+
+async fn cache_dashboard_section_if_changed(
+    conn: &mut redis::aio::MultiplexedConnection,
+    instance_id: Uuid,
+    section: &str,
+    value: &Value,
+) -> Result<bool, AppError> {
+    let sanitized = sanitize_dashboard_section(section, value);
+    let serialized = serde_json::to_string(&sanitized).map_err(|e| AppError::Internal(e.into()))?;
+    let key = format!("streambot:{instance_id}:dashboard:{section}");
+    let old: Option<String> = conn.get(&key).await?;
+    if old.as_deref() == Some(serialized.as_str()) {
+        return Ok(false);
+    }
+    let _: () = conn.set(key, serialized).await?;
+    Ok(true)
+}
+
+async fn cache_json_value_if_changed(
+    conn: &mut redis::aio::MultiplexedConnection,
+    key: String,
+    value: &Value,
+) -> Result<bool, AppError> {
+    let serialized = serde_json::to_string(value).map_err(|e| AppError::Internal(e.into()))?;
+    let old: Option<String> = conn.get(&key).await?;
+    if old.as_deref() == Some(serialized.as_str()) {
+        return Ok(false);
+    }
+    let _: () = conn.set(key, serialized).await?;
+    Ok(true)
 }
 
 pub fn moderator_map_contains(value: &Value, twitch_user_id: &str) -> bool {
@@ -1193,6 +1279,21 @@ async fn notify_dashboard_viewers(state: &AppState, _streamer_id: Uuid, instance
     notify_instance(state, instance_id, message).await;
 }
 
+
+async fn notify_dashboard_meta_viewers(state: &AppState, instance_id: Uuid) {
+    let mut conn = match state.valkey.get_multiplexed_async_connection().await { Ok(c) => c, Err(_) => return };
+    let updated_at: Option<String> = conn.get(format!("streambot:{instance_id}:dashboard:updated_at")).await.ok().flatten();
+    let version: Option<String> = conn.get(format!("streambot:{instance_id}:dashboard:version")).await.ok().flatten();
+    let connections_raw: Option<String> = conn.get(format!("streambot:{instance_id}:dashboard:connections")).await.ok().flatten();
+    let connections = connections_raw.and_then(|v| serde_json::from_str::<Value>(&v).ok()).unwrap_or(Value::Null);
+    notify_instance(state, instance_id, json!({
+        "type":"notify_dashboard_meta_update",
+        "instance_id":instance_id,
+        "updated_at":updated_at,
+        "version":version,
+        "connections":connections
+    })).await;
+}
 
 async fn notify_yolobox_preview_viewers(state: &AppState, _streamer_id: Uuid, instance_id: Uuid, mime: &str, data: &str) {
     notify_instance(state, instance_id, json!({

@@ -529,3 +529,20 @@ the verification token is saved:
 ```
 
 Saving `verification_token` activates the existing generated URL instead of replacing it.
+
+## Cloud WebSocket bandwidth behavior (2026-10-15)
+
+The Streambot-facing cloud socket accepts the reduced bandwidth transport used by
+Streambot Backend 2.0/3.0:
+
+- one initial `snapshot` containing the registered remote-dashboard state
+- later `{ "type": "update", "method": "notify_*", "data": ... }` messages
+- unchanged section payloads are ignored and are not re-broadcast to panel clients
+- legacy `dashboard_snapshot` / `dashboard_update` messages remain supported
+- CAVA (`notify_music_cava`) is ignored by the cloud transport
+- identical Yolobox preview frames are deduplicated
+- panel queues are bounded and transient updates are dropped when a client is stalled
+
+The panel instance WebSocket still receives one complete `notify_dashboard_snapshot`
+on connect/resync. After that, only changed sections are pushed via
+`notify_dashboard_update`; metadata-only changes use `notify_dashboard_meta_update`.
