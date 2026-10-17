@@ -409,8 +409,8 @@ async fn handle_instance_message(
             if !matches!(method,
                 "twitch_timeout" | "twitch_ban" | "twitch_unban" | "twitch_warn" |
                 "twitch_clear_chat" | "twitch_delete_message" |
-                "twitch_moderator" | "twitch_unmoderator" |
-                "twitch_vip" | "twitch_unvip" |
+                "twitch_unmoderator" |
+                "twitch_unvip" |
                 "twitch_shield_mode" |
                 "twitch_slow_chat" | "twitch_emote_only" |
                 "twitch_followers_only" | "twitch_subscribers_only" |

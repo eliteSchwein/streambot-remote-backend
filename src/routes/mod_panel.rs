@@ -97,9 +97,26 @@ pub(crate) async fn websocket_dashboard(app: &AppState, session: &Session, insta
 
 
 pub(crate) async fn websocket_dashboard_action(app: &AppState, session: &Session, instance_id: Uuid, section: &str, action: &str, payload: Value, request_id: Uuid) -> Result<(), AppError> {
-    require_access(app, session, instance_id).await?;
+    let role = require_access(app, session, instance_id).await?;
     if !valid_dashboard_section(section) && section != "twitch" && section != "twitch_users" { return Err(AppError::NotFound); }
     if action.trim().is_empty() { return Err(AppError::BadRequest("action cannot be empty".into())); }
+
+    // Promotions are intentionally not exposed through the cloud panel.
+    // Adding moderators/VIPs must be done directly on Twitch/local Streambot.
+    if matches!(action, "twitch_moderator" | "twitch_vip") {
+        return Err(AppError::Forbidden);
+    }
+
+    // A moderator may manage normal users, but must never be able to punish or
+    // demote the broadcaster/another moderator through the cloud panel. Owners
+    // are not restricted by this guard.
+    if role == "mod" && is_user_targeted_moderation_action(action) {
+        if let Some(target) = moderation_target(&payload) {
+            if target_is_protected_moderator(app, instance_id, target).await? {
+                return Err(AppError::Forbidden);
+            }
+        }
+    }
     let sender = app.streambot_connections.read().await.get(&instance_id).cloned()
         .ok_or_else(|| AppError::BadRequest("Streambot instance is offline".into()))?;
     // Backend 3.0 action_result messages only contain request_id/success/data.
@@ -127,6 +144,98 @@ pub(crate) async fn websocket_dashboard_action(app: &AppState, session: &Session
 
 pub fn valid_dashboard_section(section: &str) -> bool {
     DASHBOARD_SECTIONS.contains(&section)
+}
+
+fn is_user_targeted_moderation_action(action: &str) -> bool {
+    matches!(
+        action,
+        "twitch_timeout"
+            | "twitch_ban"
+            | "twitch_unban"
+            | "twitch_warn"
+            | "twitch_unmoderator"
+            | "twitch_unvip"
+    )
+}
+
+fn moderation_target(payload: &Value) -> Option<&str> {
+    let map = payload.as_object()?;
+    [
+        "user_id",
+        "user",
+        "username",
+        "login",
+        "target_user_id",
+        "target_user",
+        "target",
+    ]
+    .into_iter()
+    .find_map(|key| map.get(key).and_then(Value::as_str))
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+}
+
+fn moderator_map_matches_target(value: &Value, target: &str) -> bool {
+    let target = target.trim().trim_start_matches('@');
+    if target.is_empty() {
+        return false;
+    }
+
+    fn item_matches(item: &Value, target: &str) -> bool {
+        [
+            "twitch_user_id",
+            "user_id",
+            "id",
+            "login",
+            "user_login",
+            "username",
+            "display_name",
+        ]
+        .into_iter()
+        .filter_map(|key| item.get(key).and_then(Value::as_str))
+        .any(|value| value.eq_ignore_ascii_case(target))
+    }
+
+    match value {
+        Value::Array(items) => items.iter().any(|item| item_matches(item, target)),
+        Value::Object(map) => {
+            map.keys().any(|key| key.eq_ignore_ascii_case(target))
+                || map.values().any(|item| item_matches(item, target))
+        }
+        _ => false,
+    }
+}
+
+async fn target_is_protected_moderator(
+    app: &AppState,
+    instance_id: Uuid,
+    target: &str,
+) -> Result<bool, AppError> {
+    let target = target.trim().trim_start_matches('@');
+    if target.is_empty() {
+        return Ok(false);
+    }
+
+    let owner: Option<(String, String)> = sqlx::query_as(
+        r#"
+        SELECT s.twitch_user_id, s.login
+        FROM streambot_instances i
+        JOIN streamers s ON s.id = i.streamer_id
+        WHERE i.id = $1
+        "#,
+    )
+    .bind(instance_id)
+    .fetch_optional(&app.db)
+    .await?;
+
+    if let Some((owner_id, owner_login)) = owner {
+        if owner_id.eq_ignore_ascii_case(target) || owner_login.eq_ignore_ascii_case(target) {
+            return Ok(true);
+        }
+    }
+
+    let moderators = load_moderator_map(app, instance_id).await?;
+    Ok(moderator_map_matches_target(&moderators, target))
 }
 
 async fn instance_streamer_id(app: &AppState, instance_id: Uuid) -> Result<Uuid, AppError> {
