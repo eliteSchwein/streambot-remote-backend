@@ -1173,11 +1173,32 @@ async fn handle_streambot_message(
         }
         "dashboard_action_result" | "action_result" => {
             let request_id = value.get("request_id").cloned().unwrap_or(Value::Null);
-            let section = value.get("section").cloned().unwrap_or(Value::Null);
-            let action = value.get("action").cloned().unwrap_or(Value::Null);
+            let mut section = value.get("section").cloned().unwrap_or(Value::Null);
+            let mut action = value.get("action").cloned().unwrap_or(Value::Null);
+
+            // Backend 3.0 intentionally keeps action_result small and only sends
+            // request_id/success/data. Recover the originating action metadata from
+            // Valkey so the remote panel can identify results such as twitch_user_info.
+            if (section.is_null() || action.is_null()) && !request_id.is_null() {
+                if let Some(request_id_str) = request_id.as_str() {
+                    let key = format!("streambot:{instance_id}:action_request:{request_id_str}");
+                    let raw: Option<String> = conn.get(&key).await?;
+                    let _: () = conn.del(&key).await?;
+                    if let Some(meta) = raw.and_then(|raw| serde_json::from_str::<Value>(&raw).ok()) {
+                        if section.is_null() {
+                            section = meta.get("section").cloned().unwrap_or(Value::Null);
+                        }
+                        if action.is_null() {
+                            action = meta.get("action").cloned().unwrap_or(Value::Null);
+                        }
+                    }
+                }
+            }
+
             let success = value.get("success").and_then(Value::as_bool).unwrap_or_else(|| value.get("error").is_none());
             let data = value.get("data").cloned().unwrap_or(Value::Null);
             let error = value.get("error").cloned().unwrap_or(Value::Null);
+
             notify_instance(state, instance_id, json!({
                 "type":"notify_dashboard_action_result",
                 "instance_id":instance_id,
@@ -1188,6 +1209,18 @@ async fn handle_streambot_message(
                 "data":data,
                 "error":error
             })).await;
+
+            // Also expose user lookup results through the normal notify/update shape.
+            // This makes the result usable by the Twitch user card without coupling
+            // it to the generic action-result handler.
+            if success && action.as_str() == Some("twitch_user_info") {
+                notify_instance(state, instance_id, json!({
+                    "type":"update",
+                    "method":"notify_twitch_user_info",
+                    "instance_id":instance_id,
+                    "data":data
+                })).await;
+            }
         }
         "cava" | "music_cava" | "notify_music_cava" => {
             // High-frequency CAVA has its own local /cava/<target> websocket and

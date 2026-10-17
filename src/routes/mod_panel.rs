@@ -98,10 +98,21 @@ pub(crate) async fn websocket_dashboard(app: &AppState, session: &Session, insta
 
 pub(crate) async fn websocket_dashboard_action(app: &AppState, session: &Session, instance_id: Uuid, section: &str, action: &str, payload: Value, request_id: Uuid) -> Result<(), AppError> {
     require_access(app, session, instance_id).await?;
-    if !valid_dashboard_section(section) && section != "twitch" { return Err(AppError::NotFound); }
+    if !valid_dashboard_section(section) && section != "twitch" && section != "twitch_users" { return Err(AppError::NotFound); }
     if action.trim().is_empty() { return Err(AppError::BadRequest("action cannot be empty".into())); }
     let sender = app.streambot_connections.read().await.get(&instance_id).cloned()
         .ok_or_else(|| AppError::BadRequest("Streambot instance is offline".into()))?;
+    // Backend 3.0 action_result messages only contain request_id/success/data.
+    // Persist the originating section/action briefly so the cloud can restore
+    // that metadata when the result comes back and the panel can route it.
+    let mut conn = app.valkey.get_multiplexed_async_connection().await?;
+    let request_meta = json!({"section":section,"action":action}).to_string();
+    let _: () = conn.set_ex(
+        format!("streambot:{instance_id}:action_request:{request_id}"),
+        request_meta,
+        120,
+    ).await?;
+
     let command = json!({
         "type":"dashboard_action",
         "request_id":request_id,
