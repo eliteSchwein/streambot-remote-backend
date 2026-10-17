@@ -71,6 +71,18 @@ pub(crate) async fn websocket_dashboard(app: &AppState, session: &Session, insta
     let version: Option<String> = conn.get(format!("streambot:{instance_id}:dashboard:version")).await?;
     let connections_raw: Option<String> = conn.get(format!("streambot:{instance_id}:dashboard:connections")).await?;
     let connections = connections_raw.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or(Value::Null);
+
+    // Non-dashboard notify state that the cloud panel must be able to reconstruct
+    // after reconnecting. Keep this separate from dashboard sections so new
+    // notify payloads do not have to masquerade as cards/sections.
+    let mut notifications = Map::new();
+    for method in ["notify_twitch_user_list"] {
+        let raw: Option<String> = conn.get(format!("streambot:{instance_id}:notify:{method}")).await?;
+        if let Some(value) = raw.and_then(|v| serde_json::from_str(&v).ok()) {
+            notifications.insert(method.to_owned(), value);
+        }
+    }
+
     Ok(json!({
         "instance_id": instance_id,
         "role": role,
@@ -79,13 +91,14 @@ pub(crate) async fn websocket_dashboard(app: &AppState, session: &Session, insta
         "version": version,
         "connections": connections,
         "sections": sections,
+        "notifications": notifications,
     }))
 }
 
 
 pub(crate) async fn websocket_dashboard_action(app: &AppState, session: &Session, instance_id: Uuid, section: &str, action: &str, payload: Value, request_id: Uuid) -> Result<(), AppError> {
     require_access(app, session, instance_id).await?;
-    if !valid_dashboard_section(section) { return Err(AppError::NotFound); }
+    if !valid_dashboard_section(section) && section != "twitch" { return Err(AppError::NotFound); }
     if action.trim().is_empty() { return Err(AppError::BadRequest("action cannot be empty".into())); }
     let sender = app.streambot_connections.read().await.get(&instance_id).cloned()
         .ok_or_else(|| AppError::BadRequest("Streambot instance is offline".into()))?;

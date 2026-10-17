@@ -403,6 +403,34 @@ async fn handle_instance_message(
     let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
 
     match kind {
+        "twitch_action" | "action" => {
+            let method = value.get("method").and_then(Value::as_str)
+                .ok_or_else(|| AppError::BadRequest("method is required".into()))?;
+            if !matches!(method,
+                "twitch_timeout" | "twitch_ban" | "twitch_unban" | "twitch_warn" |
+                "twitch_clear_chat" | "twitch_delete_message" |
+                "twitch_moderator" | "twitch_unmoderator" |
+                "twitch_vip" | "twitch_unvip" |
+                "twitch_shield_mode" |
+                "twitch_slow_chat" | "twitch_emote_only" |
+                "twitch_followers_only" | "twitch_subscribers_only" |
+                "twitch_unique_chat"
+            ) {
+                return Err(AppError::BadRequest("unsupported Twitch cloud action".into()));
+            }
+            let params = value.get("params").cloned().unwrap_or(Value::Null);
+            let request_id = value.get("request_id").and_then(Value::as_str)
+                .and_then(|v| Uuid::parse_str(v).ok()).unwrap_or_else(Uuid::new_v4);
+
+            websocket_dashboard_action(state, session, instance_id, "twitch", method, params, request_id).await?;
+            Ok(Some(json!({
+                "type":"notify_dashboard_action_accepted",
+                "instance_id":instance_id,
+                "section":"twitch",
+                "action":method,
+                "request_id":request_id
+            })))
+        }
         "dashboard_action" => {
             let section = value.get("section").and_then(Value::as_str)
                 .ok_or_else(|| AppError::BadRequest("section is required".into()))?;
@@ -1002,6 +1030,22 @@ async fn handle_streambot_message(
                         meta_delta.insert("connections".into(), delta);
                     }
                 }
+
+                // Backend 3.0 can include cached notify state in its initial cloud
+                // snapshot. Persist it independently so a newly opened cloud panel
+                // receives the complete current Twitch user list immediately.
+                if let Some(user_list) = map.get("notify_twitch_user_list").or_else(|| map.get("twitch_user_list")) {
+                    let key = format!("streambot:{instance_id}:notify:notify_twitch_user_list");
+                    if let Some(delta) = cache_json_full_with_delta(&mut conn, key, user_list).await? {
+                        notify_instance(state, instance_id, json!({
+                            "type":"update",
+                            "method":"notify_twitch_user_list",
+                            "instance_id":instance_id,
+                            "data":delta,
+                            "updated_at":chrono::Utc::now().to_rfc3339()
+                        })).await;
+                    }
+                }
             }
 
             if !changed_sections.is_empty() || !meta_delta.is_empty() {
@@ -1080,6 +1124,19 @@ async fn handle_streambot_message(
                     notify_instance(state, instance_id, json!({
                         "type":"update",
                         "method":"notify_connections_update",
+                        "instance_id":instance_id,
+                        "data":delta,
+                        "updated_at":updated_at
+                    })).await;
+                }
+            } else if method == "notify_twitch_user_list" {
+                let incoming_delta = value.get("data").cloned().unwrap_or(Value::Null);
+                let key = format!("streambot:{instance_id}:notify:{method}");
+                if let Some(delta) = cache_json_delta(&mut conn, key, &incoming_delta).await? {
+                    let updated_at = chrono::Utc::now().to_rfc3339();
+                    notify_instance(state, instance_id, json!({
+                        "type":"update",
+                        "method":method,
                         "instance_id":instance_id,
                         "data":delta,
                         "updated_at":updated_at
@@ -1184,37 +1241,6 @@ fn section_notify_method(section: &str) -> &'static str {
         "yolobox" => "notify_yolobox_update",
         _ => "notify_dashboard_update",
     }
-}
-
-async fn cache_dashboard_section_if_changed(
-    conn: &mut redis::aio::MultiplexedConnection,
-    instance_id: Uuid,
-    section: &str,
-    value: &Value,
-) -> Result<bool, AppError> {
-    let sanitized = sanitize_dashboard_section(section, value);
-    let serialized = serde_json::to_string(&sanitized).map_err(|e| AppError::Internal(e.into()))?;
-    let key = format!("streambot:{instance_id}:dashboard:{section}");
-    let old: Option<String> = conn.get(&key).await?;
-    if old.as_deref() == Some(serialized.as_str()) {
-        return Ok(false);
-    }
-    let _: () = conn.set(key, serialized).await?;
-    Ok(true)
-}
-
-async fn cache_json_value_if_changed(
-    conn: &mut redis::aio::MultiplexedConnection,
-    key: String,
-    value: &Value,
-) -> Result<bool, AppError> {
-    let serialized = serde_json::to_string(value).map_err(|e| AppError::Internal(e.into()))?;
-    let old: Option<String> = conn.get(&key).await?;
-    if old.as_deref() == Some(serialized.as_str()) {
-        return Ok(false);
-    }
-    let _: () = conn.set(key, serialized).await?;
-    Ok(true)
 }
 
 async fn cache_json_full_with_delta(
@@ -1478,36 +1504,6 @@ async fn notify_instance_presence(state: &AppState, streamer_id: Uuid, instance_
     for user_id in recipients { notify_user(state, &user_id, message.clone()).await; }
     notify_instance(state, instance_id, message).await;
 }
-
-async fn notify_dashboard_viewers(state: &AppState, _streamer_id: Uuid, instance_id: Uuid, section: Option<&str>) {
-    let mut conn = match state.valkey.get_multiplexed_async_connection().await { Ok(c) => c, Err(_) => return };
-    let message = if let Some(section) = section {
-        let raw: Option<String> = conn.get(format!("streambot:{instance_id}:dashboard:{section}")).await.ok().flatten();
-        let data = raw.and_then(|v| serde_json::from_str::<Value>(&v).ok()).unwrap_or(Value::Null);
-        json!({"type":"notify_dashboard_update","instance_id":instance_id,"section":section,"data":data})
-    } else {
-        let mut sections = serde_json::Map::new();
-        for section in crate::routes::mod_panel::DASHBOARD_SECTIONS {
-            let raw: Option<String> = conn.get(format!("streambot:{instance_id}:dashboard:{section}")).await.ok().flatten();
-            sections.insert(section.to_string(), raw.and_then(|v| serde_json::from_str::<Value>(&v).ok()).unwrap_or(Value::Null));
-        }
-        let updated_at: Option<String> = conn.get(format!("streambot:{instance_id}:dashboard:updated_at")).await.ok().flatten();
-        let version: Option<String> = conn.get(format!("streambot:{instance_id}:dashboard:version")).await.ok().flatten();
-        let connections_raw: Option<String> = conn.get(format!("streambot:{instance_id}:dashboard:connections")).await.ok().flatten();
-        let connections = connections_raw.and_then(|v| serde_json::from_str::<Value>(&v).ok()).unwrap_or(Value::Null);
-        json!({"type":"notify_dashboard_snapshot","data":{
-            "instance_id":instance_id,
-            "online":true,
-            "updated_at":updated_at,
-            "version":version,
-            "connections":connections,
-            "sections":Value::Object(sections)
-        }})
-    };
-    notify_instance(state, instance_id, message).await;
-}
-
-
 
 async fn notify_cloud_delta_viewers(
     state: &AppState,
