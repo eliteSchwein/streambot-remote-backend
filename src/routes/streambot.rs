@@ -1001,7 +1001,64 @@ async fn handle_streambot_message(
             let mut meta_delta = serde_json::Map::new();
 
             if let Value::Object(map) = dashboard {
+                // Backend 3.0 exposes audio state and output devices through two
+                // independent notify methods. Keep both in one canonical cached
+                // audio section so one payload can never replace the other.
+                let mut audio_full = serde_json::Map::new();
+                if let Some(audio) = map.get("audio") {
+                    if let Some(obj) = audio.as_object() {
+                        if obj.contains_key("data") || obj.contains_key("outputs") {
+                            audio_full.extend(obj.clone());
+                        } else {
+                            audio_full.insert("data".into(), audio.clone());
+                        }
+                    } else {
+                        audio_full.insert("data".into(), audio.clone());
+                    }
+                }
+                if let Some(audio) = map.get("notify_audio_update") {
+                    audio_full.insert("data".into(), audio.clone());
+                }
+                if let Some(outputs) = map.get("notify_audio_outputs_update") {
+                    audio_full.insert("outputs".into(), outputs.clone());
+                }
+                if !audio_full.is_empty() {
+                    if let Some(delta) = cache_dashboard_full_with_delta(
+                        &mut conn,
+                        instance_id,
+                        "audio",
+                        &Value::Object(audio_full),
+                    ).await? {
+                        changed_sections.push(("audio".to_owned(), delta));
+                    }
+                }
+
+                // Macro updates in Backend 3.0 use notify_macro_update and may
+                // wrap the actual map in {macros:{...}}. Normalize that shape
+                // before caching. The sanitizer keeps description and removes
+                // hide_from_cloud entries defensively.
+                let macro_source = map.get("macros")
+                    .or_else(|| map.get("notify_macro_update"))
+                    .or_else(|| map.get("notify_macros_update"));
+                if let Some(macros) = macro_source {
+                    let normalized = normalize_macro_payload(macros);
+                    if let Some(delta) = cache_dashboard_full_with_delta(
+                        &mut conn,
+                        instance_id,
+                        "macros",
+                        &normalized,
+                    ).await? {
+                        changed_sections.push(("macros".to_owned(), delta));
+                    }
+                }
+
                 for (key, section_data) in map {
+                    if matches!(key.as_str(),
+                        "audio" | "notify_audio_update" | "notify_audio_outputs_update" |
+                        "macros" | "notify_macro_update" | "notify_macros_update"
+                    ) {
+                        continue;
+                    }
                     let section = if valid_dashboard_section(key) {
                         Some(key.as_str())
                     } else {
@@ -1094,6 +1151,50 @@ async fn handle_streambot_message(
             let method = value.get("method").and_then(Value::as_str).unwrap_or("");
             if method == "notify_music_cava" {
                 // CAVA is intentionally never mirrored through the cloud websocket.
+            } else if method == "notify_audio_update" || method == "notify_audio_outputs_update" {
+                let incoming = value.get("data").cloned().unwrap_or(Value::Null);
+                let field = if method == "notify_audio_outputs_update" { "outputs" } else { "data" };
+                let mut nested_map = serde_json::Map::new();
+                nested_map.insert(field.to_owned(), incoming);
+                let nested = Value::Object(nested_map);
+                if let Some(delta) = cache_dashboard_delta(
+                    &mut conn,
+                    instance_id,
+                    "audio",
+                    &nested,
+                ).await? {
+                    let updated_at = chrono::Utc::now().to_rfc3339();
+                    let _: () = conn.set(format!("streambot:{instance_id}:dashboard:updated_at"), &updated_at).await?;
+                    let outbound = delta.get(field).cloned().unwrap_or(Value::Null);
+                    notify_cloud_delta_viewers(
+                        state,
+                        instance_id,
+                        method,
+                        "audio",
+                        outbound,
+                        &updated_at,
+                    ).await;
+                }
+            } else if method == "notify_macro_update" || method == "notify_macros_update" {
+                let incoming = value.get("data").cloned().unwrap_or(Value::Null);
+                let normalized = normalize_macro_payload(&incoming);
+                if let Some(delta) = cache_dashboard_delta(
+                    &mut conn,
+                    instance_id,
+                    "macros",
+                    &normalized,
+                ).await? {
+                    let updated_at = chrono::Utc::now().to_rfc3339();
+                    let _: () = conn.set(format!("streambot:{instance_id}:dashboard:updated_at"), &updated_at).await?;
+                    notify_cloud_delta_viewers(
+                        state,
+                        instance_id,
+                        method,
+                        "macros",
+                        delta,
+                        &updated_at,
+                    ).await;
+                }
             } else if let Some(section) = cloud_notify_method_section(method) {
                 let incoming_delta = value.get("data").cloned().unwrap_or(Value::Null);
 
@@ -1250,10 +1351,10 @@ fn cloud_notify_method_section(method: &str) -> Option<&'static str> {
         "notify_giveaway_update" | "giveaway" => Some("giveaway"),
         "notify_interactions_update" | "interactions" => Some("interactions"),
         "notify_auto_macros_update" | "auto_macros" => Some("auto_macros"),
-        "notify_macros_update" | "macros" => Some("macros"),
-        "notify_channel_points_update" | "channel_points" => Some("channel_points"),
+        "notify_macro_update" | "notify_macros_update" | "macros" => Some("macros"),
+        "notify_channel_point_update" | "notify_channel_points_update" | "channel_points" => Some("channel_points"),
         "notify_rotating_scene_update" | "rotating_scene" => Some("rotating_scene"),
-        "notify_audio_update" | "audio" => Some("audio"),
+        "notify_audio_update" | "notify_audio_outputs_update" | "audio" => Some("audio"),
         "notify_obs_update" | "obs" => Some("obs"),
         "notify_yolobox_update" | "yolobox" => Some("yolobox"),
         _ => None,
@@ -1266,8 +1367,8 @@ fn section_notify_method(section: &str) -> &'static str {
         "giveaway" => "notify_giveaway_update",
         "interactions" => "notify_interactions_update",
         "auto_macros" => "notify_auto_macros_update",
-        "macros" => "notify_macros_update",
-        "channel_points" => "notify_channel_points_update",
+        "macros" => "notify_macro_update",
+        "channel_points" => "notify_channel_point_update",
         "rotating_scene" => "notify_rotating_scene_update",
         "audio" => "notify_audio_update",
         "obs" => "notify_obs_update",
@@ -1468,6 +1569,13 @@ pub async fn load_moderator_map(state: &AppState, instance_id: Uuid) -> Result<V
     }
 }
 
+fn normalize_macro_payload(value: &Value) -> Value {
+    value.get("macros")
+        .filter(|macros| macros.is_object())
+        .cloned()
+        .unwrap_or_else(|| value.clone())
+}
+
 fn sanitize_dashboard_section(section: &str, value: &Value) -> Value {
     match section {
         "macros" => {
@@ -1478,8 +1586,18 @@ fn sanitize_dashboard_section(section: &str, value: &Value) -> Value {
                     out.insert(key.clone(), Value::Null);
                     continue;
                 }
+                if macro_value.get("hide_from_cloud").and_then(Value::as_bool).unwrap_or(false) {
+                    // A hidden macro must never be persisted or exposed by cloud.
+                    // A null tombstone also removes an older cached copy.
+                    out.insert(key.clone(), Value::Null);
+                    continue;
+                }
                 let name = macro_value.get("name").and_then(Value::as_str).unwrap_or(key);
-                out.insert(key.clone(), json!({ "name": name }));
+                let description = macro_value.get("description").and_then(Value::as_str).unwrap_or("");
+                out.insert(key.clone(), json!({
+                    "name": name,
+                    "description": description
+                }));
             }
             Value::Object(out)
         }
