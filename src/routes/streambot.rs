@@ -1088,6 +1088,30 @@ async fn handle_streambot_message(
                     }
                 }
 
+                // Song-request state may also be present as top-level macro
+                // variables in Backend 3.0 snapshots. Merge only that subtree into
+                // music.songrequest; do not cache the complete variables object.
+                let snapshot_songrequest = map.get("notify_song_request_update")
+                    .or_else(|| map.get("song_requests"))
+                    .or_else(|| map.get("songrequest"))
+                    .or_else(|| map.get("variables").and_then(|v| v.get("songrequest")))
+                    .or_else(|| map.get("notify_variables_update").and_then(|v| {
+                        v.get("songrequest")
+                            .or_else(|| v.get("variables").and_then(|vars| vars.get("songrequest")))
+                    }))
+                    .and_then(normalize_song_request_payload);
+                if let Some(songrequest) = snapshot_songrequest {
+                    let nested = json!({"songrequest": songrequest});
+                    if let Some(delta) = cache_dashboard_delta(
+                        &mut conn,
+                        instance_id,
+                        "music",
+                        &nested,
+                    ).await? {
+                        changed_sections.push(("music".to_owned(), delta));
+                    }
+                }
+
                 // Backend 3.0 can include cached notify state in its initial cloud
                 // snapshot. Persist it independently so a newly opened cloud panel
                 // receives the complete current Twitch user list immediately.
@@ -1174,6 +1198,64 @@ async fn handle_streambot_message(
                         outbound,
                         &updated_at,
                     ).await;
+                }
+            } else if method == "notify_song_request_update" {
+                // Backend 3.0 exposes the complete song-request queue through a
+                // dedicated cloud notification. Keep music.songrequest canonical in
+                // Valkey, while forwarding the dedicated method to connected panels.
+                let incoming = value.get("data").cloned().unwrap_or(Value::Null);
+                if let Some(songrequest) = normalize_song_request_payload(&incoming) {
+                    let nested = json!({"songrequest": songrequest});
+                    if let Some(delta) = cache_dashboard_delta(
+                        &mut conn,
+                        instance_id,
+                        "music",
+                        &nested,
+                    ).await? {
+                        let updated_at = chrono::Utc::now().to_rfc3339();
+                        let _: () = conn.set(format!("streambot:{instance_id}:dashboard:updated_at"), &updated_at).await?;
+                        let outbound = delta.get("songrequest").cloned().unwrap_or(Value::Null);
+                        notify_cloud_delta_viewers(
+                            state,
+                            instance_id,
+                            "notify_song_request_update",
+                            "music",
+                            outbound,
+                            &updated_at,
+                        ).await;
+                    }
+                }
+            } else if method == "notify_variables_update" {
+                // Backend 3.0 refreshes variables.songrequest immediately after
+                // song-request add/toggle attempts. Mirror only that narrow state
+                // into the canonical music cache so the cloud panel sees the new
+                // enabled/query_blocked/query_already_present values immediately
+                // without exposing the complete macro-variable tree.
+                let incoming = value.get("data").cloned().unwrap_or(Value::Null);
+                let songrequest = incoming
+                    .get("songrequest")
+                    .cloned()
+                    .or_else(|| incoming.get("variables").and_then(|v| v.get("songrequest")).cloned());
+
+                if let Some(songrequest) = songrequest.as_ref().and_then(normalize_song_request_payload) {
+                    let nested = json!({"songrequest": songrequest});
+                    if let Some(delta) = cache_dashboard_delta(
+                        &mut conn,
+                        instance_id,
+                        "music",
+                        &nested,
+                    ).await? {
+                        let updated_at = chrono::Utc::now().to_rfc3339();
+                        let _: () = conn.set(format!("streambot:{instance_id}:dashboard:updated_at"), &updated_at).await?;
+                        notify_cloud_delta_viewers(
+                            state,
+                            instance_id,
+                            "notify_music_update",
+                            "music",
+                            delta,
+                            &updated_at,
+                        ).await;
+                    }
                 }
             } else if method == "notify_macro_update" || method == "notify_macros_update" {
                 let incoming = value.get("data").cloned().unwrap_or(Value::Null);
@@ -1311,6 +1393,36 @@ async fn handle_streambot_message(
                 "error":error
             })).await;
 
+            // Song-request list actions can return the canonical queue directly.
+            // Merge it into music.songrequest and publish the dedicated update so
+            // panels do not need to wait for a later music refresh.
+            if success && matches!(
+                action.as_str(),
+                Some("music.song_requests.list") | Some("music_song_requests")
+            ) {
+                if let Some(songrequest) = normalize_song_request_payload(&data) {
+                    let nested = json!({"songrequest": songrequest});
+                    if let Some(delta) = cache_dashboard_delta(
+                        &mut conn,
+                        instance_id,
+                        "music",
+                        &nested,
+                    ).await? {
+                        let updated_at = chrono::Utc::now().to_rfc3339();
+                        let _: () = conn.set(format!("streambot:{instance_id}:dashboard:updated_at"), &updated_at).await?;
+                        let outbound = delta.get("songrequest").cloned().unwrap_or(Value::Null);
+                        notify_cloud_delta_viewers(
+                            state,
+                            instance_id,
+                            "notify_song_request_update",
+                            "music",
+                            outbound,
+                            &updated_at,
+                        ).await;
+                    }
+                }
+            }
+
             // Also expose user lookup results through the normal notify/update shape.
             // This makes the result usable by the Twitch user card without coupling
             // it to the generic action-result handler.
@@ -1345,9 +1457,79 @@ async fn handle_streambot_message(
     Ok(())
 }
 
+fn normalize_song_request_payload(value: &Value) -> Option<Value> {
+    let source = value
+        .get("songrequest")
+        .or_else(|| value.get("song_requests"))
+        .unwrap_or(value);
+    let source_map = source.as_object()?;
+    let mut out = source_map.clone();
+
+    // Current Backend 3.0 shape uses items/total/current_index. Keep support for
+    // the older queue-based snapshot so cached instances upgrade seamlessly.
+    if !out.contains_key("items") {
+        if let Some(queue) = source_map.get("queue").and_then(Value::as_array) {
+            let title_map = source_map.get("title_map").and_then(Value::as_object);
+            let current_url = source_map.get("current_url").and_then(Value::as_str);
+            let current_index = source_map.get("queue_position").and_then(Value::as_u64).unwrap_or(0) as usize;
+
+            let items = queue.iter().enumerate().map(|(index, item)| {
+                if let Some(item_map) = item.as_object() {
+                    let mut normalized = item_map.clone();
+                    normalized.entry("index").or_insert_with(|| json!(index));
+                    let item_url = normalized.get("url").and_then(Value::as_str).map(str::to_owned);
+                    if !normalized.contains_key("id") {
+                        if let Some(url) = item_url.as_deref() {
+                            normalized.insert("id".into(), json!(url));
+                        }
+                    }
+                    if !normalized.contains_key("title") {
+                        if let Some(url) = item_url.as_deref() {
+                            if let Some(title) = title_map.and_then(|map| map.get(url)) {
+                                normalized.insert("title".into(), title.clone());
+                            }
+                        }
+                    }
+                    if !normalized.contains_key("current") {
+                        let current = item_url.as_deref() == current_url
+                            || index == current_index;
+                        normalized.insert("current".into(), json!(current));
+                    }
+                    Value::Object(normalized)
+                } else {
+                    let url = item.as_str().unwrap_or_default();
+                    let title = title_map.and_then(|map| map.get(url)).cloned().unwrap_or(Value::Null);
+                    json!({
+                        "id": url,
+                        "index": index,
+                        "url": url,
+                        "title": title,
+                        "current": current_url == Some(url) || index == current_index
+                    })
+                }
+            }).collect::<Vec<_>>();
+            out.insert("items".into(), Value::Array(items));
+        }
+    }
+
+    if !out.contains_key("total") {
+        let total = source_map.get("queue_length").cloned().or_else(|| {
+            out.get("items").and_then(Value::as_array).map(|items| json!(items.len()))
+        });
+        if let Some(total) = total { out.insert("total".into(), total); }
+    }
+    if !out.contains_key("current_index") {
+        if let Some(index) = source_map.get("queue_position") {
+            out.insert("current_index".into(), index.clone());
+        }
+    }
+
+    Some(Value::Object(out))
+}
+
 fn cloud_notify_method_section(method: &str) -> Option<&'static str> {
     match method {
-        "notify_music_update" | "music" => Some("music"),
+        "notify_music_update" | "notify_song_request_update" | "music" => Some("music"),
         "notify_giveaway_update" | "giveaway" => Some("giveaway"),
         "notify_interactions_update" | "interactions" => Some("interactions"),
         "notify_auto_macros_update" | "auto_macros" => Some("auto_macros"),
