@@ -78,12 +78,9 @@ fn normalize_refresh_type(value: &str) -> Result<&'static str, AppError> {
 
 async fn refresh_twitch_token(
     state: AppState,
-    headers: HeaderMap,
     auth_type: &str,
     body: TwitchRefreshRequest,
 ) -> Result<Json<TwitchRefreshResponse>, AppError> {
-    let (_streamer_id, instance_id, name) = authenticate_instance(&state, &headers).await?;
-
     let refresh_token = body.refresh_token.trim();
     if refresh_token.is_empty() {
         return Err(AppError::BadRequest("refresh_token is required".into()));
@@ -97,10 +94,8 @@ async fn refresh_twitch_token(
         .map_err(AppError::Internal)?;
 
     tracing::info!(
-        instance_id = %instance_id,
-        instance_name = %name,
         auth_type = auth_type,
-        "refreshed Twitch access token for Streambot instance"
+        "refreshed Twitch access token"
     );
 
     Ok(Json(TwitchRefreshResponse {
@@ -116,30 +111,27 @@ async fn refresh_twitch_token(
 
 pub async fn twitch_refresh_control(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<TwitchRefreshRequest>,
 ) -> Result<Json<TwitchRefreshResponse>, AppError> {
-    refresh_twitch_token(state, headers, "control", body).await
+    refresh_twitch_token(state, "control", body).await
 }
 
 pub async fn twitch_refresh_message(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<TwitchRefreshRequest>,
 ) -> Result<Json<TwitchRefreshResponse>, AppError> {
-    refresh_twitch_token(state, headers, "message", body).await
+    refresh_twitch_token(state, "message", body).await
 }
 
 pub async fn twitch_refresh(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<TwitchRefreshRequest>,
 ) -> Result<Json<TwitchRefreshResponse>, AppError> {
     let auth_type = body.r#type.as_deref().ok_or_else(|| {
         AppError::BadRequest("type is required and must be control or message".into())
     })?;
     let auth_type = normalize_refresh_type(auth_type)?;
-    refresh_twitch_token(state, headers, auth_type, body).await
+    refresh_twitch_token(state, auth_type, body).await
 }
 
 
