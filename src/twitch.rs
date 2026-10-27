@@ -59,6 +59,20 @@ impl TwitchClient {
         Ok(response)
     }
 
+    pub async fn refresh_token(&self, refresh_token: &str) -> anyhow::Result<TokenResponse> {
+        let response = self.http.post("https://id.twitch.tv/oauth2/token")
+            .form(&[
+                ("client_id", self.client_id.as_str()),
+                ("client_secret", self.client_secret.as_str()),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+            ])
+            .send().await?
+            .error_for_status()?
+            .json().await?;
+        Ok(response)
+    }
+
     pub async fn current_user(&self, access_token: &str) -> anyhow::Result<TwitchUser> {
         let response: UsersResponse = self.http.get("https://api.twitch.tv/helix/users")
             .header("Client-Id", &self.client_id)

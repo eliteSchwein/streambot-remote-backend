@@ -1,5 +1,5 @@
 use axum::{Json, extract::State, http::HeaderMap};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -13,16 +13,34 @@ pub struct InstanceAuthResponse {
     name: String,
 }
 
-pub async fn instance_auth(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<InstanceAuthResponse>, AppError> {
+#[derive(Debug, Deserialize)]
+pub struct TwitchRefreshRequest {
+    pub refresh_token: String,
+    #[serde(default)]
+    pub r#type: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TwitchRefreshResponse {
+    client_id: String,
+    access_token: String,
+    refresh_token: String,
+    expires_in: i64,
+    obtainment_timestamp: i64,
+    scope: Vec<String>,
+    auth_type: String,
+}
+
+async fn authenticate_instance(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(Uuid, Uuid, String), AppError> {
     let auth = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or_else(|| {
-            tracing::warn!("instance-auth rejected: missing bearer token");
+            tracing::warn!("instance authentication rejected: missing bearer token");
             AppError::Unauthorized
         })?;
 
@@ -33,13 +51,95 @@ pub async fn instance_auth(
         .bind(hash)
         .fetch_optional(&state.db)
         .await?;
-    let (streamer_id, instance_id, name) = row.ok_or_else(|| {
-        tracing::warn!("instance-auth rejected: bearer token did not match an instance");
+
+    row.ok_or_else(|| {
+        tracing::warn!("instance authentication rejected: bearer token did not match an instance");
         AppError::Unauthorized
-    })?;
+    })
+}
+
+pub async fn instance_auth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<InstanceAuthResponse>, AppError> {
+    let (streamer_id, instance_id, name) = authenticate_instance(&state, &headers).await?;
 
     tracing::info!(streamer_id = %streamer_id, instance_id = %instance_id, name = %name, "Streambot instance authenticated");
     Ok(Json(InstanceAuthResponse { streamer_id, instance_id, name }))
+}
+
+fn normalize_refresh_type(value: &str) -> Result<&'static str, AppError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "control" | "bot" => Ok("control"),
+        "message" | "message_bot" | "message-bot" => Ok("message"),
+        _ => Err(AppError::BadRequest("type must be control or message".into())),
+    }
+}
+
+async fn refresh_twitch_token(
+    state: AppState,
+    headers: HeaderMap,
+    auth_type: &str,
+    body: TwitchRefreshRequest,
+) -> Result<Json<TwitchRefreshResponse>, AppError> {
+    let (_streamer_id, instance_id, name) = authenticate_instance(&state, &headers).await?;
+
+    let refresh_token = body.refresh_token.trim();
+    if refresh_token.is_empty() {
+        return Err(AppError::BadRequest("refresh_token is required".into()));
+    }
+
+    let auth_type = normalize_refresh_type(auth_type)?;
+    let token = state
+        .twitch
+        .refresh_token(refresh_token)
+        .await
+        .map_err(AppError::Internal)?;
+
+    tracing::info!(
+        instance_id = %instance_id,
+        instance_name = %name,
+        auth_type = auth_type,
+        "refreshed Twitch access token for Streambot instance"
+    );
+
+    Ok(Json(TwitchRefreshResponse {
+        client_id: state.config.twitch_client_id.clone(),
+        access_token: token.access_token,
+        refresh_token: token.refresh_token,
+        expires_in: token.expires_in,
+        obtainment_timestamp: chrono::Utc::now().timestamp_millis(),
+        scope: token.scope,
+        auth_type: auth_type.to_string(),
+    }))
+}
+
+pub async fn twitch_refresh_control(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TwitchRefreshRequest>,
+) -> Result<Json<TwitchRefreshResponse>, AppError> {
+    refresh_twitch_token(state, headers, "control", body).await
+}
+
+pub async fn twitch_refresh_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TwitchRefreshRequest>,
+) -> Result<Json<TwitchRefreshResponse>, AppError> {
+    refresh_twitch_token(state, headers, "message", body).await
+}
+
+pub async fn twitch_refresh(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TwitchRefreshRequest>,
+) -> Result<Json<TwitchRefreshResponse>, AppError> {
+    let auth_type = body.r#type.as_deref().ok_or_else(|| {
+        AppError::BadRequest("type is required and must be control or message".into())
+    })?;
+    let auth_type = normalize_refresh_type(auth_type)?;
+    refresh_twitch_token(state, headers, auth_type, body).await
 }
 
 
