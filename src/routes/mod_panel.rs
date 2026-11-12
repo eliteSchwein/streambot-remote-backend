@@ -42,9 +42,13 @@ pub(crate) async fn websocket_instances(app: &AppState, session: &Session) -> Re
         "#,
     ).fetch_all(&app.db).await?;
     let connections = app.streambot_connections.read().await;
+    let mut conn = app.valkey.get_multiplexed_async_connection().await?;
     let mut output = Vec::new();
     for row in rows {
         if let Some(role) = access_role(app, session, row.streamer_id, row.id).await? {
+            // Boot progress of the local backend (shown in the dashboard).
+            let bootup_raw: Option<String> = conn.get(format!("streambot:{}:notify:notify_bootup_stage", row.id)).await?;
+            let bootup = bootup_raw.and_then(|v| serde_json::from_str::<Value>(&v).ok()).unwrap_or(Value::Null);
             output.push(json!({
                 "id": row.id,
                 "streamer_id": row.streamer_id,
@@ -53,6 +57,7 @@ pub(crate) async fn websocket_instances(app: &AppState, session: &Session) -> Re
                 "streamer_display_name": row.streamer_display_name,
                 "role": role,
                 "online": connections.contains_key(&row.id),
+                "bootup": bootup,
             }));
         }
     }
@@ -76,7 +81,7 @@ pub(crate) async fn websocket_dashboard(app: &AppState, session: &Session, insta
     // after reconnecting. Keep this separate from dashboard sections so new
     // notify payloads do not have to masquerade as cards/sections.
     let mut notifications = Map::new();
-    for method in ["notify_twitch_user_list"] {
+    for method in ["notify_twitch_user_list", "notify_bootup_stage"] {
         let raw: Option<String> = conn.get(format!("streambot:{instance_id}:notify:{method}")).await?;
         if let Some(value) = raw.and_then(|v| serde_json::from_str(&v).ok()) {
             notifications.insert(method.to_owned(), value);

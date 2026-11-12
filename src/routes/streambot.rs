@@ -1127,6 +1127,22 @@ async fn handle_streambot_message(
                         })).await;
                     }
                 }
+
+                // Boot progress of the local backend. The snapshot carries the
+                // full state; later changes arrive as notify_bootup_stage deltas.
+                if let Some(bootup) = map.get("notify_bootup_stage") {
+                    let key = format!("streambot:{instance_id}:notify:notify_bootup_stage");
+                    if let Some(delta) = cache_json_full_with_delta(&mut conn, key, bootup).await? {
+                        notify_instance(state, instance_id, json!({
+                            "type":"update",
+                            "method":"notify_bootup_stage",
+                            "instance_id":instance_id,
+                            "data":delta,
+                            "updated_at":chrono::Utc::now().to_rfc3339()
+                        })).await;
+                        notify_instance_bootup(state, streamer_id, instance_id).await;
+                    }
+                }
             }
 
             if !changed_sections.is_empty() || !meta_delta.is_empty() {
@@ -1341,7 +1357,7 @@ async fn handle_streambot_message(
                         "updated_at":updated_at
                     })).await;
                 }
-            } else if method == "notify_twitch_user_list" {
+            } else if method == "notify_twitch_user_list" || method == "notify_bootup_stage" {
                 let incoming_delta = value.get("data").cloned().unwrap_or(Value::Null);
                 let key = format!("streambot:{instance_id}:notify:{method}");
                 if let Some(delta) = cache_json_delta(&mut conn, key, &incoming_delta).await? {
@@ -1353,6 +1369,9 @@ async fn handle_streambot_message(
                         "data":delta,
                         "updated_at":updated_at
                     })).await;
+                    if method == "notify_bootup_stage" {
+                        notify_instance_bootup(state, streamer_id, instance_id).await;
+                    }
                 }
             } else {
                 tracing::trace!(%instance_id, %method, "ignoring unregistered cloud update method");
@@ -1851,7 +1870,8 @@ fn strip_keys_recursive(value: &Value, keys: &[&str]) -> Value {
 }
 
 
-async fn notify_instance_presence(state: &AppState, streamer_id: Uuid, instance_id: Uuid, online: bool) {
+/// Users that see an instance in their instance list (owner + moderators).
+async fn instance_audience(state: &AppState, streamer_id: Uuid, instance_id: Uuid) -> Vec<String> {
     let owner: Option<String> = sqlx::query_scalar("SELECT twitch_user_id FROM streamers WHERE id=$1")
         .bind(streamer_id).fetch_optional(&state.db).await.ok().flatten();
     let mut recipients = Vec::new();
@@ -1862,9 +1882,23 @@ async fn notify_instance_presence(state: &AppState, streamer_id: Uuid, instance_
         }
     }
     recipients.sort(); recipients.dedup();
+    recipients
+}
+
+async fn notify_instance_presence(state: &AppState, streamer_id: Uuid, instance_id: Uuid, online: bool) {
     let message = json!({"type":"notify_instance_presence","instance_id":instance_id,"online":online});
-    for user_id in recipients { notify_user(state, &user_id, message.clone()).await; }
+    for user_id in instance_audience(state, streamer_id, instance_id).await { notify_user(state, &user_id, message.clone()).await; }
     notify_instance(state, instance_id, message).await;
+}
+
+/// Sends the full cached boot progress of an instance to everyone who sees it
+/// in their instance list (dashboard), not only to open instance pages.
+async fn notify_instance_bootup(state: &AppState, streamer_id: Uuid, instance_id: Uuid) {
+    let Ok(mut conn) = state.valkey.get_multiplexed_async_connection().await else { return; };
+    let raw: Option<String> = conn.get(format!("streambot:{instance_id}:notify:notify_bootup_stage")).await.ok().flatten();
+    let Some(bootup) = raw.and_then(|v| serde_json::from_str::<Value>(&v).ok()) else { return; };
+    let message = json!({"type":"notify_instance_bootup","instance_id":instance_id,"bootup":bootup});
+    for user_id in instance_audience(state, streamer_id, instance_id).await { notify_user(state, &user_id, message.clone()).await; }
 }
 
 async fn notify_cloud_delta_viewers(
