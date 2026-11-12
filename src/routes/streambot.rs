@@ -1133,6 +1133,35 @@ async fn handle_streambot_message(
                 let updated_at = chrono::Utc::now().to_rfc3339();
                 let _: () = conn.set(format!("streambot:{instance_id}:dashboard:updated_at"), &updated_at).await?;
                 for (section, delta) in changed_sections {
+                    // The cached audio section combines two notifications
+                    // (data + outputs). Panels apply notify_audio_update to
+                    // audio.data and notify_audio_outputs_update to
+                    // audio.outputs, so split the section delta accordingly
+                    // instead of sending the whole section as audio data.
+                    if section == "audio" {
+                        if let Some(data) = delta.get("data") {
+                            notify_cloud_delta_viewers(
+                                state,
+                                instance_id,
+                                "notify_audio_update",
+                                "audio",
+                                data.clone(),
+                                &updated_at,
+                            ).await;
+                        }
+                        if let Some(outputs) = delta.get("outputs") {
+                            notify_cloud_delta_viewers(
+                                state,
+                                instance_id,
+                                "notify_audio_outputs_update",
+                                "audio",
+                                outputs.clone(),
+                                &updated_at,
+                            ).await;
+                        }
+                        continue;
+                    }
+
                     notify_cloud_delta_viewers(
                         state,
                         instance_id,
