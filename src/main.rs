@@ -33,6 +33,7 @@ async fn main() -> anyhow::Result<()> {
         db,
         valkey,
         twitch,
+        http: reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build()?,
         streambot_connections: Arc::new(RwLock::new(HashMap::new())),
         user_connections: Arc::new(RwLock::new(HashMap::new())),
         instance_connections: Arc::new(RwLock::new(HashMap::new())),
@@ -65,6 +66,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/ws/user", get(routes::streambot::ws_user))
         .route("/ws/instance/{instance_id}", get(routes::streambot::ws_instance))
         .route("/webhooks/kofi/{webhook_id}", post(routes::kofi::webhook))
+        .route("/api/v1/live/{stream_key}", get(routes::webcam::live_status))
+        .route("/internal/mediamtx/auth", post(routes::webcam::mediamtx_auth))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);

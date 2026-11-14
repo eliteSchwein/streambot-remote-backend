@@ -467,6 +467,53 @@ Streambot websocket liveness is intentionally strict:
 - the Valkey `streambot:{instance_id}:online` safety key has a 30 second TTL,
 - clean disconnects and heartbeat timeouts delete the online key immediately and emit `notify_instance_presence` with `online:false`.
 
+## Webcam stream relay (MediaMTX)
+
+A Streambot can publish any number of webcams (H.264 + Opus, MPEG-TS over SRT)
+to the `mediamtx` compose service. Anyone with a camera's viewer link can watch
+it via WebRTC (WHEP) at `<FRONTEND_URL>/live/<stream_key>`.
+
+- Each camera is identified by the bot-chosen `camera_id` (`^[A-Za-z0-9_-]{1,64}$`)
+  and stored in `webcam_streams (instance_id, camera_id, name, stream_key)`.
+- `stream_key` = lowercase unpadded base32 of 20 random bytes, generated on the
+  camera's first `webcam_stream_start` (insert-if-missing). It never changes
+  afterwards, so the viewer URL of a camera is identical every time it streams.
+  It is deleted with the row (`webcam_camera_removed` or instance deletion).
+- Streambot sends `{"type":"webcam_stream_start","camera_id","name"}` on
+  `/ws/streambot` (name trimmed, max 64 chars). The cloud upserts the row, creates
+  a fresh random publish password, stores `webcam:{stream_key}` =
+  `{"instance_id","camera_id","password"}`, `streambot:{instance_id}:webcam:{camera_id}`
+  = stream_key and the set `streambot:{instance_id}:webcams` in Valkey and replies
+  `{"type":"webcam_stream_credentials","camera_id","stream_key","publish_url","viewer_url"}`.
+  Restarting an active camera invalidates the old password and kicks its publisher.
+- `{"type":"webcam_stream_stop","camera_id"}` deletes that camera's Valkey
+  entries and kicks the MediaMTX publisher/readers, so the link stops working at once.
+- `{"type":"webcam_camera_removed","camera_id"}` does the same and deletes the row.
+- A Streambot disconnect stops all active cameras of the instance (rows are kept).
+- Instance panel sockets receive
+  `{"type":"notify_webcam_streams","instance_id","streams":[{"camera_id","name","viewer_url","whep_url","active"}]}`
+  (all cameras, sorted by name, then camera_id) on connect and on every change.
+- MediaMTX authorizes every publish/read via `POST /internal/mediamtx/auth?secret=<MEDIAMTX_AUTH_SECRET>`.
+- `GET /api/v1/live/{stream_key}` (public) returns 404 when no session exists,
+  otherwise `{"online":bool,"name":"...","whep_url":"..."}`.
+
+Environment:
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `MEDIAMTX_AUTH_SECRET` | yes | | Shared secret for the MediaMTX auth hook. Use a URL-safe value (`openssl rand -hex 32`). |
+| `MEDIAMTX_API_URL` | no | `http://mediamtx:9997` | MediaMTX control API (internal only). |
+| `MEDIAMTX_HOST` | yes | | Public hostname/IP of MediaMTX. SRT, WHEP and RTSP URLs are built from it and the ports below. (Falls back to `MEDIAMTX_SRT_HOST`.) |
+| `MEDIAMTX_SRT_PORT` | no | `18890` | SRT ingest port (backend and docker-compose). |
+| `MEDIAMTX_WEBRTC_PORT` | no | `18889` | WebRTC/WHEP HTTP port (backend and docker-compose). |
+| `MEDIAMTX_WEBRTC_UDP_PORT` | compose only | `18189` | WebRTC ICE UDP port. |
+| `MEDIAMTX_RTSP_PORT` | no | `18554` | Read-only RTSP (TCP) port (backend and docker-compose). |
+| `MEDIAMTX_PUBLIC_URL` | no | `http://<MEDIAMTX_HOST>:<MEDIAMTX_WEBRTC_PORT>` | Override for the browser-facing WHEP base, e.g. `https://live.example.com` behind a reverse proxy. Required in practice when the frontend is served over HTTPS (browsers block plain-HTTP WHEP from HTTPS pages). |
+| `MEDIAMTX_SRT_HOST` | no | `MEDIAMTX_HOST` | Override for the SRT ingest host. |
+| `MEDIAMTX_WEBRTC_ADDITIONAL_HOSTS` | compose only | | Comma separated public IPs/hosts advertised as WebRTC ICE candidates. |
+
+Published ports (defaults, deliberately not MediaMTX's defaults so a local dev MediaMTX can run alongside): `18890/udp` (SRT), `18889/tcp` (WebRTC/WHEP HTTP), `18189/udp` (WebRTC ICE), `18554/tcp` (RTSP, read only). Container and host ports are always identical, because WebRTC advertises its listening port in ICE candidates. The MediaMTX API (`9997`) stays inside the compose network.
+
 ## Ko-fi webhook integration
 
 Ko-fi configuration is owner-only and is managed over `/ws/user`.

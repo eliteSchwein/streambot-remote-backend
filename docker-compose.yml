@@ -19,6 +19,32 @@ services:
     ports:
       - "8080:8080"
 
+  mediamtx:
+    image: bluenviron/mediamtx:1.21.3
+    restart: unless-stopped
+    environment:
+      # MediaMTX overrides any mediamtx.yml key with MTX_<UPPERCASE KEY>.
+      # Values are interpolated by docker compose from the project .env file.
+      # Use a URL-safe MEDIAMTX_AUTH_SECRET (e.g. `openssl rand -hex 32`).
+      MTX_AUTHHTTPADDRESS: http://backend:8080/internal/mediamtx/auth?secret=${MEDIAMTX_AUTH_SECRET:?MEDIAMTX_AUTH_SECRET must be set}
+      # Comma separated public IPs/hostnames advertised as WebRTC ICE candidates.
+      MTX_WEBRTCADDITIONALHOSTS: ${MEDIAMTX_WEBRTC_ADDITIONAL_HOSTS:?MEDIAMTX_WEBRTC_ADDITIONAL_HOSTS must be set}
+      # Non-default ports (no clash with a local dev MediaMTX on 8890/8889/8189).
+      # Container and host ports are identical: WebRTC advertises its own
+      # listening port in ICE candidates, so it must match the published port.
+      MTX_SRTADDRESS: :${MEDIAMTX_SRT_PORT:-18890}
+      MTX_WEBRTCADDRESS: :${MEDIAMTX_WEBRTC_PORT:-18889}
+      MTX_WEBRTCLOCALUDPADDRESS: :${MEDIAMTX_WEBRTC_UDP_PORT:-18189}
+      MTX_RTSPADDRESS: :${MEDIAMTX_RTSP_PORT:-18554}
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
+    ports:
+      - "${MEDIAMTX_SRT_PORT:-18890}:${MEDIAMTX_SRT_PORT:-18890}/udp" # SRT ingest
+      - "${MEDIAMTX_WEBRTC_PORT:-18889}:${MEDIAMTX_WEBRTC_PORT:-18889}/tcp" # WebRTC HTTP (WHEP)
+      - "${MEDIAMTX_WEBRTC_UDP_PORT:-18189}:${MEDIAMTX_WEBRTC_UDP_PORT:-18189}/udp" # WebRTC ICE
+      - "${MEDIAMTX_RTSP_PORT:-18554}:${MEDIAMTX_RTSP_PORT:-18554}/tcp" # RTSP (read only)
+      # 9997 (control API) is intentionally only reachable inside the compose network.
+
   postgres:
     image: postgres:18-trixie
     user: "0:0"

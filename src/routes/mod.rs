@@ -4,3 +4,4 @@ pub mod mod_panel;
 pub mod streambot;
 
 pub mod kofi;
+pub mod webcam;

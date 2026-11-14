@@ -22,6 +22,7 @@ use crate::{
         kofi::{websocket_delete_kofi_settings, websocket_kofi_settings, websocket_save_kofi_settings},
         mod_panel::{valid_dashboard_section, websocket_dashboard, websocket_dashboard_action,
         websocket_instances},
+        webcam::{remove_webcam_camera, start_webcam_stream, stop_all_webcam_streams, stop_webcam_stream, webcam_state_message},
     },
     session::{Session, get_session, random_token},
     state::AppState,
@@ -357,6 +358,9 @@ async fn handle_instance_socket(
         }
     }
 
+    let webcam_state = webcam_state_message(&state, instance_id).await;
+    let _ = sender.send(Message::Text(webcam_state.to_string().into())).await;
+
     // Every instance websocket owns its own Tokio send task/queue. A slow or noisy
     // instance therefore cannot block another instance's frontend updates.
     let send_task = tokio::spawn(async move {
@@ -590,6 +594,13 @@ async fn handle_user_message(state: &AppState, session: &Session, text: &str) ->
 
 
 async fn purge_instance_cache(state: &AppState, instance_id: Uuid) {
+    // The instance row (and its webcam_streams rows) is already gone; active
+    // sessions are resolved through `streambot:{id}:webcams` in Valkey. This
+    // also kicks any MediaMTX publisher/readers of the deleted instance.
+    if let Err(err) = stop_all_webcam_streams(state, instance_id).await {
+        tracing::warn!(%instance_id, error=?err, "failed to clean up webcam stream of deleted instance");
+    }
+
     let mut conn = match state.valkey.get_multiplexed_async_connection().await {
         Ok(conn) => conn,
         Err(err) => {
@@ -721,7 +732,7 @@ async fn notify_users(state: &AppState, mut user_ids: Vec<String>, value: Value)
     for user_id in user_ids { notify_user(state, &user_id, value.clone()).await; }
 }
 
-async fn notify_instance(state: &AppState, instance_id: Uuid, value: Value) {
+pub(crate) async fn notify_instance(state: &AppState, instance_id: Uuid, value: Value) {
     let text = value.to_string();
     let senders: Vec<mpsc::Sender<String>> = {
         let connections = state.instance_connections.read().await;
@@ -921,7 +932,24 @@ async fn handle_socket(
     }
 
     send_task.abort();
-    state.streambot_connections.write().await.remove(&instance_id);
+    // Only tear down per-connection state when this socket is still the
+    // registered one. A fast reconnect may already have replaced it, and the
+    // new connection may have started a fresh webcam session.
+    let superseded = {
+        let mut connections = state.streambot_connections.write().await;
+        let superseded = connections.get(&instance_id).is_some_and(|current| !current.same_channel(&tx));
+        if !superseded {
+            connections.remove(&instance_id);
+        }
+        superseded
+    };
+    if superseded {
+        tracing::info!(%instance_id, "superseded Streambot websocket disconnected");
+        return;
+    }
+    if let Err(error) = stop_all_webcam_streams(&state, instance_id).await {
+        tracing::warn!(%instance_id, error = ?error, "failed to clean up webcam streams on disconnect");
+    }
     if let Ok(mut conn) = state.valkey.get_multiplexed_async_connection().await {
         let _: redis::RedisResult<usize> = conn.del(format!("streambot:{instance_id}:online")).await;
     }
@@ -1487,6 +1515,9 @@ async fn handle_streambot_message(
             // High-frequency CAVA has its own local /cava/<target> websocket and
             // must never consume cloud bandwidth or Valkey writes.
         }
+        "webcam_stream_start" => start_webcam_stream(state, instance_id, &value).await?,
+        "webcam_stream_stop" => stop_webcam_stream(state, instance_id, &value).await?,
+        "webcam_camera_removed" => remove_webcam_camera(state, instance_id, &value).await?,
         "hello" | "heartbeat" => {}
         _ => {
             let _: () = conn.set(

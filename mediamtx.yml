@@ -1,0 +1,76 @@
+# MediaMTX relay for Streambot webcam streams.
+#
+# Bots publish H.264 + Opus in MPEG-TS over SRT to live/<stream_key>; viewers
+# read via WebRTC (WHEP). Every publish/read is authorized by the backend through
+# the HTTP auth hook. Secrets are NOT stored in this file: docker-compose injects
+# them through MTX_* environment variables, which override the values below:
+#   MTX_AUTHHTTPADDRESS        -> authHTTPAddress (includes ?secret=...)
+#   MTX_WEBRTCADDITIONALHOSTS  -> webrtcAdditionalHosts (comma separated)
+
+logLevel: info
+logDestinations: [stdout]
+
+readTimeout: 10s
+writeTimeout: 10s
+
+###############################################
+# Authentication
+
+authMethod: http
+# Fail-closed placeholder (no secret -> backend answers 401). Overridden by
+# MTX_AUTHHTTPADDRESS from docker-compose.
+authHTTPAddress: http://backend:8080/internal/mediamtx/auth
+authHTTPExclude:
+  - action: api
+  - action: metrics
+
+###############################################
+# Control API (internal only; not published to the host)
+
+api: yes
+apiAddress: :9997
+
+metrics: no
+pprof: no
+playback: no
+
+###############################################
+# Disabled protocols
+
+# RTSP (read-only access for viewers, e.g. OBS media source / VLC). TCP only,
+# so no RTP/RTCP UDP port ranges have to be opened. Port overridden by
+# MTX_RTSPADDRESS from docker-compose (MEDIAMTX_RTSP_PORT).
+rtsp: yes
+rtspAddress: :18554
+rtspTransports: [tcp]
+rtspEncryption: "no"
+rtmp: no
+hls: no
+# Media over QUIC (enabled by default since 1.2x), unused.
+moq: no
+
+###############################################
+# SRT (bot ingest)
+
+srt: yes
+srtAddress: :18890
+
+###############################################
+# WebRTC (WHEP playback)
+
+webrtc: yes
+webrtcAddress: :18889
+webrtcLocalUDPAddress: :18189
+webrtcLocalTCPAddress: ''
+webrtcIPsFromInterfaces: yes
+# Public IPs/hostnames advertised as ICE candidates. Overridden by
+# MTX_WEBRTCADDITIONALHOSTS from docker-compose.
+webrtcAdditionalHosts: []
+webrtcICEServers2: []
+
+###############################################
+# Paths
+
+paths:
+  "~^live/[a-z2-7]{32}$":
+    source: publisher

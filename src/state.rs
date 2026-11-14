@@ -13,6 +13,8 @@ pub struct AppState {
     pub db: PgPool,
     pub valkey: redis::Client,
     pub twitch: TwitchClient,
+    /// Shared HTTP client for internal service calls (MediaMTX control API).
+    pub http: reqwest::Client,
     pub streambot_connections: Arc<RwLock<HashMap<Uuid, mpsc::Sender<Message>>>>,
     pub user_connections: Arc<RwLock<HashMap<String, Vec<mpsc::Sender<String>>>>>,
     pub instance_connections: Arc<RwLock<HashMap<Uuid, HashMap<String, Vec<mpsc::Sender<String>>>>>>,
